@@ -1,0 +1,161 @@
+name: Codex Security status
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request whose current security result should be refreshed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-security-status-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Publish Codex Security status
+    # Fork/Dependabot PR tokens are read-only. Their native bot receipts are
+    # handled by the trusted issue_comment run after this workflow is merged.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]') ||
+      (github.event.issue.pull_request &&
+       github.event.comment.user.id == 199175422 &&
+       startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      # No checkout or execution of PR code. This only reads the native review
+      # bot's structured receipt and publishes a status on the exact PR head.
+      # It neither runs another AI scan nor requires an OpenAI API key.
+      - name: Publish current-commit security result
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const BOT_ID = 199175422;
+            const BOT_LOGIN = 'chatgpt-codex-connector[bot]';
+            const MARKER = '<!-- codex-pull-request-review-summary -->';
+            const STATUS_NAME = 'Codex Security Review';
+            const { owner, repo } = context.repo;
+            const rawNumber = context.payload.pull_request?.number
+              ?? context.payload.issue?.number
+              ?? context.payload.inputs?.pr_number;
+            const number = Number(rawNumber);
+            if (!Number.isSafeInteger(number) || number < 1) {
+              throw new Error('A valid pull request number is required.');
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: number,
+            });
+            if (pr.state !== 'open') {
+              core.info('Pull request is closed; no status was changed.');
+              return;
+            }
+            const sha = pr.head.sha;
+            if (!/^[a-f0-9]{40}$/.test(sha)) {
+              throw new Error('GitHub returned an invalid head SHA.');
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const summaries = comments.filter(c =>
+              c.user?.id === BOT_ID && c.user?.login === BOT_LOGIN &&
+              typeof c.body === 'string' && c.body.startsWith(MARKER)
+            ).sort((a, b) =>
+              (Date.parse(b.updated_at) - Date.parse(a.updated_at)) || (b.id - a.id)
+            );
+            function markerJson(body, name) {
+              const prefix = '<!-- ' + name + ' ';
+              const lines = body.split(/\r?\n/).filter(l => l.startsWith(prefix));
+              if (lines.length !== 1 || !lines[0].endsWith(' -->')) {
+                throw new Error('Missing or ambiguous native security receipt.');
+              }
+              return JSON.parse(lines[0].slice(prefix.length, -4));
+            }
+            let state = 'pending';
+            let description = 'Waiting for Codex Security to review the current commit.';
+            let target = pr.html_url;
+            for (const comment of summaries) {
+              let receipt;
+              let result;
+              try {
+                receipt = markerJson(comment.body, 'codex-security-review:v1');
+                result = markerJson(comment.body, 'codex-review-state:v1').security_review;
+                if (!receipt || !result || typeof result !== 'object') {
+                  throw new Error('Incomplete native security receipt.');
+                }
+                if (receipt.repository !== owner + '/' + repo ||
+                    receipt.pullRequestNumber !== number) {
+                  throw new Error('Receipt repository or PR number does not match.');
+                }
+                if (receipt.headSha !== sha || result.commit_sha !== sha) {
+                  continue; // An earlier commit can never make a new commit green.
+                }
+                if (receipt.status !== result.status) {
+                  throw new Error('Native security receipt statuses disagree.');
+                }
+                target = comment.html_url || pr.html_url;
+                if (result.status === 'completed') {
+                  if (typeof result.has_any_findings !== 'boolean' ||
+                      typeof result.has_unresolved_findings !== 'boolean' ||
+                      (!result.has_any_findings && result.has_unresolved_findings)) {
+                    throw new Error('Completed review has no consistent findings result.');
+                  }
+                  if (result.has_any_findings) {
+                    state = 'failure';
+                    description = 'Codex Security flagged findings. Read the review before merging.';
+                  } else {
+                    state = 'success';
+                    description = 'Codex Security completed this commit with no reported findings.';
+                  }
+                } else if (['running', 'queued', 'pending', 'in_progress'].includes(result.status)) {
+                  state = 'pending';
+                  description = 'Codex Security is reviewing the current commit.';
+                } else {
+                  state = 'error';
+                  description = 'Codex Security did not complete. Check the review and retry.';
+                }
+              } catch (error) {
+                state = 'error';
+                description = 'Cannot verify the native security result. Check the review receipt.';
+                core.warning(error.message);
+              }
+              break;
+            }
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, state,
+              context: STATUS_NAME,
+              description,
+              target_url: target,
+            });
+            core.info(STATUS_NAME + ': ' + state + ' for ' + sha);
+            // This is deliberately NOT a required check or a merge rule.
+            // Missing, interrupted, or unparseable reviews never become success.
+
+  status-tests:
+    name: Test security status publisher
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - run: node --test .github/scripts/codex-security-status.test.cjs
