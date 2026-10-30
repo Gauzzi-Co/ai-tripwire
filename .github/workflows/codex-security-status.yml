@@ -1,263 +1,115 @@
 name: Codex Security status
 
-# Both events execute the workflow from the default branch. Never add a
-# PR-revision, workflow_call, or selectable-ref workflow_dispatch trigger here.
+# These events always execute the workflow on the default branch. There is
+# deliberately no PR, workflow_run, workflow_call, or selectable-ref dispatch.
 on:
   issue_comment:
-    types: [created, edited, deleted]
-  workflow_run:
-    workflows: [Codex Security status tests]
-    types: [completed]
+    types: [created, edited]
+  repository_dispatch:
+    types: [codex-security-self-test]
 
 permissions:
   contents: read
 
 jobs:
-  resolve:
-    name: Resolve trusted security refresh
+  self-test:
+    name: Test trusted security status publisher
     if: >-
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
+      github.event_name == 'repository_dispatch' ||
+      (github.event.issue.pull_request &&
        github.event.comment.user.id == 199175422 &&
-       startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->')) ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.name == 'Codex Security status tests')
+       github.event.sender.id == 199175422 &&
+       startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: read
-      pull-requests: read
-    outputs:
-      pr_number: ${{ steps.target.outputs.pr_number }}
-      head_sha: ${{ steps.target.outputs.head_sha }}
-      deleted_id: ${{ steps.target.outputs.deleted_id }}
     steps:
-      - name: Resolve refresh target
-        id: target
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      # github.sha is the immutable DEFAULT-BRANCH snapshot for both allowed
+      # events, never a PR head or an artifact supplied by a contributor.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          script: |
-            const { owner, repo } = context.repo;
-            const fullName = owner + '/' + repo;
-            const bot = u => u?.id === 199175422 && u?.login === 'chatgpt-codex-connector[bot]';
-            const canonicalNumber = value => {
-              const text = String(value ?? '');
-              if (!/^[1-9][0-9]*$/.test(text) || !Number.isSafeInteger(Number(text))) {
-                throw new Error('Expected a canonical positive PR number.');
-              }
-              return Number(text);
-            };
-            let number;
-            let deletedId = '';
-            if (context.eventName === 'issue_comment') {
-              const { issue, comment, sender, action } = context.payload;
-              if (!issue?.pull_request || !bot(comment?.user) ||
-                  !comment.body?.startsWith('<!-- codex-pull-request-review-summary -->')) return;
-              // Deletion is an invalidation, not an approval, even if a human
-              // removed the bot comment. Other refreshes require the bot sender.
-              if (action !== 'deleted' && !bot(sender)) return;
-              number = canonicalNumber(issue.number);
-              if (action === 'deleted') deletedId = String(canonicalNumber(comment.id));
-            } else if (context.eventName === 'workflow_run') {
-              const id = canonicalNumber(context.payload.workflow_run?.id);
-              const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: id });
-              const path = '.github/workflows/codex-security-status-tests.yml';
-              if (run.repository?.full_name !== fullName || run.status !== 'completed' ||
-                  run.name !== 'Codex Security status tests' ||
-                  !(run.path === path || run.path?.startsWith(path + '@')) ||
-                  !['pull_request', 'pull_request_review', 'pull_request_review_comment', 'workflow_dispatch'].includes(run.event)) {
-                throw new Error('Refresh did not originate from the expected read-only workflow.');
-              }
-              // Run titles/PR numbers are DATA only. Never read artifacts,
-              // checkout code, or trust test success as security-scan evidence.
-              number = canonicalNumber(run.display_title);
-              if (run.pull_requests?.length && !run.pull_requests.some(p => p.number === number)) {
-                throw new Error('Workflow run and PR number disagree.');
-              }
-            } else {
-              throw new Error('Untrusted writer trigger.');
-            }
-            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-            if (pr.base?.repo?.full_name !== fullName) throw new Error('PR repository mismatch.');
-            if (pr.state !== 'open') return;
-            if (!/^[a-f0-9]{40}$/.test(pr.head?.sha ?? '')) throw new Error('Invalid PR head SHA.');
-            core.setOutput('pr_number', String(number));
-            core.setOutput('head_sha', pr.head.sha);
-            core.setOutput('deleted_id', deletedId);
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: node --test .github/scripts/codex-security-status.test.cjs
+      - name: Validate workflow YAML
+        run: ruby -rpsych -e 'Psych.safe_load(File.read(ARGV[0]), aliases:false)' .github/workflows/codex-security-status.yml
 
   publish:
-    name: Publish Codex Security status
-    needs: resolve
-    if: needs.resolve.outputs.pr_number != ''
+    name: Flag authenticated Codex Security findings
+    needs: self-test
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.id == 199175422 &&
+      github.event.sender.id == 199175422 &&
+      startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->')
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Statuses are commit-scoped. Serialize ALL publishers for that SHA,
-    # including different PRs sharing it. A queued refresh reads current data.
-    concurrency:
-      group: codex-security-status-${{ github.repository }}-${{ needs.resolve.outputs.head_sha }}
-      cancel-in-progress: false
     permissions:
-      contents: read
       pull-requests: read
       statuses: write
     steps:
-      - name: Publish current-commit security result
+      # No checkout, imports from the repo, artifacts, caches, or mutable
+      # comment/history reads in this write-capable job.
+      - name: Publish red-only security signal
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
-          EXPECTED_SHA: ${{ needs.resolve.outputs.head_sha }}
-          DELETED_ID: ${{ needs.resolve.outputs.deleted_id }}
         with:
           script: |
+            const BOT_ID = 199175422;
+            const BOT_LOGIN = 'chatgpt-codex-connector[bot]';
+            const SUMMARY = '<!-- codex-pull-request-review-summary -->';
+            const bot = user => user?.id === BOT_ID && user?.login === BOT_LOGIN;
+            const { issue, comment, sender, action } = context.payload;
+            if (context.eventName !== 'issue_comment' || !['created', 'edited'].includes(action) ||
+                !issue?.pull_request || !bot(comment?.user) || !bot(sender) ||
+                typeof comment.body !== 'string' || !comment.body.startsWith(SUMMARY)) {
+              core.info('Not an authenticated native security event; no status changed.');
+              return;
+            }
+            // Use the immutable, authenticated webhook BODY, not an API read
+            // of a bot-authored comment that a collaborator may have edited.
+            function marker(name) {
+              const prefix = '<!-- ' + name + ' ';
+              const lines = comment.body.split(/\r?\n/).filter(line => line.startsWith(prefix));
+              if (lines.length !== 1 || !lines[0].endsWith(' -->')) throw new Error('Ambiguous native security receipt.');
+              const value = JSON.parse(lines[0].slice(prefix.length, -4));
+              if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid native receipt.');
+              return value;
+            }
+            const receipt = marker('codex-security-review:v1');
+            const result = marker('codex-review-state:v1').security_review;
+            if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Missing security result.');
+            const flags = [result.has_any_findings, result.has_unresolved_findings];
+            if (!flags.every(value => value == null || typeof value === 'boolean')) throw new Error('Invalid findings disposition.');
+            // Red-only and monotonic: null/omitted/clean/running updates NEVER
+            // write green or clear a failure. No history or queue race can
+            // turn a previously reported finding into a clean certification.
+            if (!flags.some(value => value === true)) {
+              core.info('No positive findings signal in this event; no status changed.');
+              return;
+            }
             const { owner, repo } = context.repo;
             const fullName = owner + '/' + repo;
-            const sha = process.env.EXPECTED_SHA;
-            const numberText = process.env.PR_NUMBER ?? '';
-            const deletedText = process.env.DELETED_ID ?? '';
-            if (!/^[a-f0-9]{40}$/.test(sha ?? '') || !/^[1-9][0-9]*$/.test(numberText) ||
-                !Number.isSafeInteger(Number(numberText)) ||
-                (deletedText && (!/^[1-9][0-9]*$/.test(deletedText) || !Number.isSafeInteger(Number(deletedText))))) {
-              throw new Error('Invalid trusted target outputs.');
+            const number = issue.number;
+            if (!Number.isSafeInteger(number) || number < 1 ||
+                !Number.isSafeInteger(comment.id) || comment.id < 1 ||
+                receipt.repository !== fullName || receipt.pullRequestNumber !== number ||
+                !/^[a-f0-9]{40}$/.test(receipt.headSha ?? '') || receipt.headSha !== result.commit_sha ||
+                typeof result.status !== 'string' || !result.status || receipt.status !== result.status) {
+              throw new Error('Security receipt does not match its repository, PR, or commit.');
             }
-            const number = Number(numberText);
-            const STATUS_NAME = 'Codex Security Review';
-            const SUMMARY = '<!-- codex-pull-request-review-summary -->';
-            const FINDING = '<!-- codex-security-review-finding:v1 -->';
-            const DELETED = 'Security receipt removed; awaiting a new Codex review.';
-            const bot = u => u?.id === 199175422 && u?.login === 'chatgpt-codex-connector[bot]';
-            const prUrl = n => 'https://github.com/' + fullName + '/pull/' + n;
-            const summaryUrl = (n, id) => prUrl(n) + '#issuecomment-' + id;
-            const write = (state, description, target) => github.rest.repos.createCommitStatus({
-              owner, repo, sha, state, context: STATUS_NAME, description, target_url: target,
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (pr.base?.repo?.full_name !== fullName) throw new Error('PR repository mismatch.');
+            if (pr.state !== 'open' || pr.head?.sha !== receipt.headSha) {
+              core.info('Closed PR or stale finding; no current-head status changed.');
+              return;
+            }
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: receipt.headSha,
+              state: 'failure',
+              context: 'Codex Security Review',
+              description: 'Codex reported security findings in PR #' + number + '. Review before merging.',
+              target_url: 'https://github.com/' + fullName + '/pull/' + number + '#issuecomment-' + comment.id,
             });
-            const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-            function marker(body, name) {
-              const prefix = '<!-- ' + name + ' ';
-              const lines = body.split(/\r?\n/).filter(l => l.startsWith(prefix));
-              if (lines.length !== 1 || !lines[0].endsWith(' -->')) throw new Error('Ambiguous native receipt.');
-              const result = JSON.parse(lines[0].slice(prefix.length, -4));
-              if (!object(result)) throw new Error('Invalid native receipt object.');
-              return result;
-            }
-            function evaluate(pr, comments, inline, history) {
-              const n = pr.number;
-              const fail = (description, target = prUrl(n)) => ({ state: 'error', description, target });
-              const unknown = (description, target = prUrl(n)) => ({ state: 'pending', description, target });
-              const findings = inline.filter(c => bot(c.user) && c.body?.startsWith(FINDING) &&
-                (c.commit_id === sha || c.original_commit_id === sha));
-              const flagged = target => ({ state: 'failure', target,
-                description: 'Codex Security flagged findings in PR #' + n + '. Read the review.' });
-              // Do not fall back to an older clean summary after a newer one
-              // was deleted. Remember native summary IDs in status history.
-              let seen = 0;
-              let removed = 0;
-              for (const status of history) {
-                if (status.context !== STATUS_NAME) continue;
-                const prefix = prUrl(n) + '#issuecomment-';
-                if (!status.target_url?.startsWith(prefix)) continue;
-                const id = Number(status.target_url.slice(prefix.length));
-                if (Number.isSafeInteger(id) && id > 0) {
-                  seen = Math.max(seen, id);
-                  if (status.description === DELETED) removed = Math.max(removed, id);
-                }
-              }
-              if (n === number && deletedText) {
-                seen = Math.max(seen, Number(deletedText));
-                removed = Math.max(removed, Number(deletedText));
-              }
-              const floor = Math.max(seen, removed ? removed + 1 : 0);
-              const summaries = comments.filter(c => bot(c.user) && c.body?.startsWith(SUMMARY))
-                .sort((a, b) => (Date.parse(b.updated_at) - Date.parse(a.updated_at)) || (b.id - a.id));
-              for (const comment of summaries) {
-                const target = summaryUrl(n, comment.id);
-                try {
-                  const receipt = marker(comment.body, 'codex-security-review:v1');
-                  const result = marker(comment.body, 'codex-review-state:v1').security_review;
-                  if (!object(result) || receipt.repository !== fullName || receipt.pullRequestNumber !== n) {
-                    throw new Error('Native receipt target mismatch.');
-                  }
-                  if (!/^[a-f0-9]{40}$/.test(receipt.headSha ?? '') || receipt.headSha !== result.commit_sha) {
-                    throw new Error('Native receipt SHA fields disagree.');
-                  }
-                  if (receipt.headSha !== sha) continue; // Only consistently stale pairs are skipped.
-                  if (!Number.isSafeInteger(comment.id) || comment.id < floor) {
-                    return findings.length ? flagged(target) : unknown(DELETED,
-                      summaryUrl(n, seen));
-                  }
-                  if (receipt.status !== result.status) throw new Error('Native receipt statuses disagree.');
-                  const any = result.has_any_findings;
-                  const unresolved = result.has_unresolved_findings;
-                  if (![any, unresolved].every(v => v == null || typeof v === 'boolean') ||
-                      (any === false && unresolved === true)) throw new Error('Invalid findings disposition.');
-                  const time = Date.parse(comment.updated_at);
-                  const newerFinding = findings.some(c => !Number.isFinite(Date.parse(c.created_at)) ||
-                    !Number.isFinite(time) || Date.parse(c.created_at) > time);
-                  if (any === true || unresolved === true || newerFinding) return flagged(target);
-                  if (result.status === 'completed') {
-                    if (any === false && unresolved === false && Number.isFinite(time)) {
-                      return { state: 'success', target,
-                        description: 'Codex Security completed this commit with no reported findings.' };
-                    }
-                    // null/omitted flags are a valid UNKNOWN state, not a
-                    // parser failure. Absence of findings is never proof of clean.
-                    return findings.length ? flagged(target) : unknown(
-                      'Review completed; findings disposition unavailable. Open the native report.', target);
-                  }
-                  if (['running', 'queued', 'pending', 'in_progress'].includes(result.status)) {
-                    return findings.length ? flagged(target) : unknown('Codex Security is reviewing this commit.', target);
-                  }
-                  return fail('Codex Security did not complete. Check the review and retry.', target);
-                } catch (error) {
-                  core.warning(error.message);
-                  return findings.length ? flagged(target) : fail('Cannot verify the native security receipt.', target);
-                }
-              }
-              if (findings.length) return flagged(prUrl(n));
-              if (floor) return unknown(DELETED, summaryUrl(n, seen));
-              return unknown('Waiting for Codex Security to review the current commit.');
-            }
-            try {
-              const { data: primary } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-              if (primary.base?.repo?.full_name !== fullName) throw new Error('PR repository mismatch.');
-              const linked = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
-                owner, repo, commit_sha: sha, per_page: 100,
-              });
-              const members = new Map();
-              for (const pr of [primary, ...linked]) {
-                if (pr.state === 'open' && pr.base?.repo?.full_name === fullName && pr.head?.sha === sha) {
-                  members.set(pr.number, pr);
-                }
-              }
-              if (!members.size) { core.info('No open PR still uses this SHA; no status changed.'); return; }
-              if (members.size > 20) throw new Error('Too many PRs share this SHA; manual review required.');
-              // Remove an earlier green before fetching results. A subsequent
-              // API/read failure must not silently preserve a stale success.
-              await write('pending', deletedText ? DELETED : 'Refreshing Codex Security evidence.',
-                deletedText ? summaryUrl(number, Number(deletedText)) : prUrl(number));
-              const history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                owner, repo, ref: sha, per_page: 100,
-              });
-              const results = [];
-              for (const n of [...members.keys()].sort((a, b) => a - b)) {
-                const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number: n });
-                if (current.state !== 'open' || current.base?.repo?.full_name !== fullName || current.head?.sha !== sha) continue;
-                const comments = await github.paginate(github.rest.issues.listComments, {
-                  owner, repo, issue_number: n, per_page: 100,
-                });
-                const inline = await github.paginate(github.rest.pulls.listReviewComments, {
-                  owner, repo, pull_number: n, per_page: 100,
-                });
-                results.push(evaluate(current, comments, inline, history));
-              }
-              if (!results.length) return;
-              const rank = { failure: 3, error: 2, pending: 1, success: 0 };
-              const result = results.sort((a, b) => rank[b.state] - rank[a.state])[0];
-              // A clean PR can never overwrite a finding from another open PR
-              // sharing the commit. Status history also guards deleted receipts.
-              await write(result.state, result.description, result.target);
-              core.info(STATUS_NAME + ': ' + result.state + ' for ' + sha);
-            } catch (error) {
-              await write('error', 'Security evidence refresh failed. Inspect the workflow run.', prUrl(number));
-              core.setFailed(error.message);
-            }
+            core.info('Recorded an advisory security finding; no merge rules changed.');
