@@ -1,0 +1,115 @@
+name: Codex Security status
+
+# These events always execute the workflow on the default branch. There is
+# deliberately no PR, workflow_run, workflow_call, or selectable-ref dispatch.
+on:
+  issue_comment:
+    types: [created, edited]
+  repository_dispatch:
+    types: [codex-security-self-test]
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    name: Test trusted security status publisher
+    if: >-
+      github.event_name == 'repository_dispatch' ||
+      (github.event.issue.pull_request &&
+       github.event.comment.user.id == 199175422 &&
+       github.event.sender.id == 199175422 &&
+       startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # github.sha is the immutable DEFAULT-BRANCH snapshot for both allowed
+      # events, never a PR head or an artifact supplied by a contributor.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: node --test .github/scripts/codex-security-status.test.cjs
+      - name: Validate workflow YAML
+        run: ruby -rpsych -e 'Psych.safe_load(File.read(ARGV[0]), aliases:false)' .github/workflows/codex-security-status.yml
+
+  publish:
+    name: Flag authenticated Codex Security findings
+    needs: self-test
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.id == 199175422 &&
+      github.event.sender.id == 199175422 &&
+      startsWith(github.event.comment.body, '<!-- codex-pull-request-review-summary -->')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    steps:
+      # No checkout, imports from the repo, artifacts, caches, or mutable
+      # comment/history reads in this write-capable job.
+      - name: Publish red-only security signal
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const BOT_ID = 199175422;
+            const BOT_LOGIN = 'chatgpt-codex-connector[bot]';
+            const SUMMARY = '<!-- codex-pull-request-review-summary -->';
+            const bot = user => user?.id === BOT_ID && user?.login === BOT_LOGIN;
+            const { issue, comment, sender, action } = context.payload;
+            if (context.eventName !== 'issue_comment' || !['created', 'edited'].includes(action) ||
+                !issue?.pull_request || !bot(comment?.user) || !bot(sender) ||
+                typeof comment.body !== 'string' || !comment.body.startsWith(SUMMARY)) {
+              core.info('Not an authenticated native security event; no status changed.');
+              return;
+            }
+            // Use the immutable, authenticated webhook BODY, not an API read
+            // of a bot-authored comment that a collaborator may have edited.
+            function marker(name) {
+              const prefix = '<!-- ' + name + ' ';
+              const lines = comment.body.split(/\r?\n/).filter(line => line.startsWith(prefix));
+              if (lines.length !== 1 || !lines[0].endsWith(' -->')) throw new Error('Ambiguous native security receipt.');
+              const value = JSON.parse(lines[0].slice(prefix.length, -4));
+              if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid native receipt.');
+              return value;
+            }
+            const receipt = marker('codex-security-review:v1');
+            const result = marker('codex-review-state:v1').security_review;
+            if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Missing security result.');
+            const flags = [result.has_any_findings, result.has_unresolved_findings];
+            if (!flags.every(value => value == null || typeof value === 'boolean')) throw new Error('Invalid findings disposition.');
+            // Red-only and monotonic: null/omitted/clean/running updates NEVER
+            // write green or clear a failure. No history or queue race can
+            // turn a previously reported finding into a clean certification.
+            if (!flags.some(value => value === true)) {
+              core.info('No positive findings signal in this event; no status changed.');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const fullName = owner + '/' + repo;
+            const number = issue.number;
+            if (!Number.isSafeInteger(number) || number < 1 ||
+                !Number.isSafeInteger(comment.id) || comment.id < 1 ||
+                receipt.repository !== fullName || receipt.pullRequestNumber !== number ||
+                !/^[a-f0-9]{40}$/.test(receipt.headSha ?? '') || receipt.headSha !== result.commit_sha ||
+                typeof result.status !== 'string' || !result.status || receipt.status !== result.status) {
+              throw new Error('Security receipt does not match its repository, PR, or commit.');
+            }
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (pr.base?.repo?.full_name !== fullName) throw new Error('PR repository mismatch.');
+            if (pr.state !== 'open' || pr.head?.sha !== receipt.headSha) {
+              core.info('Closed PR or stale finding; no current-head status changed.');
+              return;
+            }
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: receipt.headSha,
+              state: 'failure',
+              context: 'Codex Security Review',
+              description: 'Codex reported security findings in PR #' + number + '. Review before merging.',
+              target_url: 'https://github.com/' + fullName + '/pull/' + number + '#issuecomment-' + comment.id,
+            });
+            core.info('Recorded an advisory security finding; no merge rules changed.');
