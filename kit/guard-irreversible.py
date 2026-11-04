@@ -35,6 +35,7 @@ import shlex
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 # ------------------------------------------------------------------ CONFIG
 OWNER_EMAILS = {"you@yourcompany.com"}  # mail sent only to yourself passes without asking
@@ -49,7 +50,7 @@ PROTECTED_PATHS = re.compile(
     r"/CLAUDE(\.local)?\.md$|/MEMORY\.md$|/\.claude\.json$|/\.mcp\.json$|/claude_desktop_config\.json$|"
     r"/\.(zshrc|zprofile|zshenv|bashrc|bash_profile|profile|gitconfig|npmrc|netrc)$|/\.ssh/|/\.aws/|"
     r"/Library/LaunchAgents/|/\.config/systemd/|/\.cursor/rules/|/\.cursorrules$|/AGENTS\.md$|/copilot-instructions\.md$|/\.vscode/(settings|mcp)\.json$|"
-    r"/\.claude/fence-alarms\.log$|/\.claude/\.git/|/\.claude/tripwire\.json$|/\.claude/plugins/|/\.cursor/mcp\.json$|/\.codeium/|/\.windsurf/|/\.github/(instructions|prompts|agents|chatmodes)/|/\.git/hooks/",
+    r"/\.claude/\.gitignore$|/\.claude/fence-alarms\.log$|/\.claude/\.git/|/\.claude/tripwire\.json$|/\.claude/plugins/|/\.cursor/mcp\.json$|/\.codeium/|/\.windsurf/|/\.github/(instructions|prompts|agents|chatmodes)/|/\.git/hooks/",
     re.I,
 )
 PROTECTED_IN_CMD = re.compile(
@@ -62,7 +63,7 @@ PROTECTED_IN_CMD = re.compile(
 )
 # Commands that can write/replace a file (a protected path + one of these = self-modification).
 WRITE_VERBS = re.compile(
-    r"(^|[\s;&|(`])(mv|cp|tee|ln|install|rsync|truncate|touch|chmod|chown|chflags|dd|patch|unlink|shred|"
+    r"(^|[\s;&|(`/])(rm|rmdir|mv|cp|tee|ln|install|rsync|truncate|touch|chmod|chown|chflags|dd|patch|unlink|shred|"
     r"sed\s+-[a-z]*i|perl\s+-[a-z]*i|python3?\s+-c|node\s+-e|ruby\s+-e|perl\s+-e|php\s+-r|"
     r"git\s+(checkout|restore|apply|stash)|chattr|curl\s.*\s-o\s|wget\s.*\s-O\s)",
     re.I,
@@ -74,12 +75,19 @@ _CONFIG_ERROR = ""
 try:
     with open(os.path.expanduser("~/.claude/tripwire.json"), encoding="utf-8") as _cf:
         _cfg = json.load(_cf)
-    if isinstance(_cfg.get("owner_emails"), list) and _cfg["owner_emails"]:
-        OWNER_EMAILS = {str(e) for e in _cfg["owner_emails"]}
-    if isinstance(_cfg.get("allowed_git_remotes"), str) and _cfg["allowed_git_remotes"]:
-        ALLOWED_GIT_REMOTES = re.compile(_cfg["allowed_git_remotes"], re.I)
-    if isinstance(_cfg.get("gate_secret_reads"), bool):
-        GATE_SECRET_READS = _cfg["gate_secret_reads"]
+    if not isinstance(_cfg, dict):
+        raise ValueError("config must be an object")
+    _owners = _cfg.get("owner_emails", list(OWNER_EMAILS))
+    _remotes = _cfg.get("allowed_git_remotes", ALLOWED_GIT_REMOTES.pattern)
+    _reads = _cfg.get("gate_secret_reads", GATE_SECRET_READS)
+    if not isinstance(_owners, list) or not all(
+        isinstance(e, str) and re.fullmatch(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", e) for e in _owners
+    ):
+        raise ValueError("owner_emails must be a list of literal addresses")
+    if not isinstance(_remotes, str) or not _remotes or not isinstance(_reads, bool):
+        raise ValueError("invalid gate configuration")
+    _compiled = re.compile(_remotes, re.I)
+    OWNER_EMAILS, ALLOWED_GIT_REMOTES, GATE_SECRET_READS = set(_owners), _compiled, _reads
 except FileNotFoundError:
     pass
 except Exception as _e:  # a broken config must not silently weaken the gate: keep defaults, say so in the first ask
@@ -107,25 +115,217 @@ def deny(reason):
 
 
 def allow():
+    if _CONFIG_ERROR:
+        _out("ask", _CONFIG_ERROR + "Repair the configuration before using policy exceptions.")
     sys.exit(0)
 
 
-def git_remote_url(cwd, remote):
+def path_forms(path, cwd):
+    """Check lexical names and symlink targets without executing shell expansion."""
+    path = path.replace("\\", "/").replace("${HOME}", os.path.expanduser("~")).replace("$HOME", os.path.expanduser("~"))
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    return {os.path.normpath(path), os.path.realpath(path)}
+
+
+def protected_path(path, cwd):
+    return any(
+        PROTECTED_PATHS.search(p)
+        or PROTECTED_PATHS.search(p.rstrip("/") + "/")
+        or p.rstrip("/").lower().endswith("/.claude")
+        for p in path_forms(path, cwd)
+    )
+
+
+def literal_command(cmd):
+    """Exceptions apply only to one static command, never to shell programs."""
+    quote = None
+    for char in cmd:
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == '"' and quote in {None, '"'}:
+            quote = None if quote else '"'
+            continue
+        if char == "'" and quote is None:
+            quote = "'"
+            continue
+        if char in "$" + chr(96) + "\\\n\r" or (quote is None and char in ";&|<>(){}*?[]#"):
+            return []
     try:
-        return subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", remote],
+        return shlex.split(cmd)
+    except ValueError:
+        return []
+
+
+def owner_send(cmd):
+    args = literal_command(cmd)
+    if args[:3] != ["gws", "gmail", "+send"]:
+        return False
+    recipients = []
+    i = 3
+    while i < len(args):
+        flag, eq, value = args[i].partition("=")
+        if flag not in {"--to", "--cc", "--bcc", "--subject", "--body"}:
+            return False
+        if not eq:
+            i += 1
+            if i >= len(args):
+                return False
+            value = args[i]
+        if flag in {"--to", "--cc", "--bcc"}:
+            parts = value.split(",")
+            if not all(re.fullmatch(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", p) for p in parts):
+                return False
+            recipients.extend(p.lower() for p in parts)
+        i += 1
+    return bool(recipients) and set(recipients) <= {e.lower() for e in OWNER_EMAILS}
+
+
+def trusted_remote(url):
+    """A trusted host mentioned in an attacker path is not a trusted authority."""
+    if re.search(r"[\s\\%?#]", url):
+        return False
+    if "://" in url:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"ssh", "https"} or not parsed.hostname or parsed.port:
+            return False
+        if parsed.password or (parsed.scheme == "https" and parsed.username):
+            return False
+        host, path = parsed.hostname, parsed.path.lstrip("/")
+    else:
+        match = re.fullmatch(r"(?:git@)?([a-zA-Z0-9.-]+):([^\s:]+)", url)
+        if not match:
+            return False
+        host, path = match.groups()
+    if any(p in {"", ".", ".."} for p in path.split("/")):
+        return False
+    return bool(ALLOWED_GIT_REMOTES.match(host.lower() + "/" + path))
+
+
+def trusted_push(cmd, cwd):
+    args = literal_command(cmd)
+    # Implicit defaults, context overrides, direct URLs and push flags need approval.
+    if len(args) < 3 or args[:2] != ["git", "push"]:
+        return False
+    remote = args[2]
+    if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9._-]*", remote):
+        return False
+    if any(arg.startswith(("-", "+", ":")) for arg in args[3:]):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "--push", "--all", remote],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
-        ).stdout.strip()
-    except Exception:
-        return ""
+        )
+        urls = result.stdout.splitlines()
+        return result.returncode == 0 and bool(urls) and all(trusted_remote(url) for url in urls)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+def temporary_delete(cmd, cwd):
+    args = literal_command(cmd)
+    if not args or os.path.basename(args[0]) not in {"rm", "rmdir"}:
+        return False
+    paths = []
+    options = True
+    for arg in args[1:]:
+        if options and arg == "--":
+            options = False
+        elif options and arg.startswith("-"):
+            continue
+        else:
+            paths.append(arg)
+    roots = {os.path.realpath(p) for p in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")}
+    return bool(paths) and all(
+        os.path.isabs(p)
+        and not protected_path(p, cwd)
+        and any(os.path.realpath(p).startswith(root + "/") for root in roots)
+        for p in paths
+    )
+
+
+def shell_protected_write(cmd, cwd, git_mutation=False):
+    """Conservative canonical targets and possible cd contexts, not a shell sandbox."""
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    if len(tokens) > 256:
+        return True
+    contexts = {os.path.realpath(cwd)}
+    for i, tok in enumerate(tokens[:-1]):
+        if tok in {"cd", "pushd"}:
+            j = i + 1
+            while j < len(tokens) and tokens[j] in {"-L", "-P", "-e"}:
+                j += 1
+            if j < len(tokens) and tokens[j] == "--":
+                j += 1
+            destination = tokens[j] if j < len(tokens) and tokens[j] not in {";", "&&", "||", "|", ")"} else "~"
+            if destination.startswith("-"):
+                return True  # directory-stack state is not available to the hook
+            for base in list(contexts):
+                contexts.update(path_forms(destination, base))
+                if len(contexts) > 8:
+                    return True
+    if git_mutation and any("/.claude/" in base.lower() or base.lower().endswith("/.claude") for base in contexts):
+        return True
+    # Downloads are writes too; retain attached/long option values as destinations.
+    if any(os.path.basename(token) in {"curl", "wget"} for token in tokens):
+        for i, token in enumerate(tokens):
+            if token in {"--remote-name", "--remote-name-all", "--remote-header-name", "-O", "-J"}:
+                return True  # destination determined by the remote, not a reviewed literal
+            target = None
+            if token in {"-o", "-O", "--output", "--output-document", "--output-dir", "--directory-prefix", "-P"}:
+                target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            elif token.startswith(("--output=", "--output-document=", "--output-dir=", "--directory-prefix=")):
+                target = token.split("=", 1)[1]
+            elif token.startswith(("-o", "-O", "-P")) and len(token) > 2:
+                target = token[2:]
+            if target is not None and (not target or any(protected_path(target, base) for base in contexts)):
+                return True
+    for i, tok in enumerate(tokens[:-1]):
+        if ">" in tok and set(tok) <= set("<>&|"):
+            if any(protected_path(tokens[i + 1], base) for base in contexts):
+                return True
+    if WRITE_VERBS.search(" ".join(tokens)) or git_mutation:
+        return any(
+            protected_path(token.split("=", 1)[-1], base)
+            for token in tokens
+            for base in contexts
+            if token and token not in {";", "&&", "||", "|"}
+        )
+    return False
+
+
+def canonical_secret_read(cmd, cwd):
+    if not re.search(r"(^|[\s;&|/])(cat|less|more|head|tail|grep|rg|sed|awk|cp|base64|xxd|od|strings)\s", cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return True
+    secrets = re.compile(
+        r"(^|/)(\.env(?:\.[^/]*)?|id_rsa|id_ed25519|\.netrc|\.npmrc|\.git-credentials)$|/\.aws/credentials$|\.(pem|p12|key)$",
+        re.I,
+    )
+    return any(secrets.search(p) for token in tokens for p in path_forms(token, cwd))
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
+        raw = sys.stdin.read(2_000_001)
+        if len(raw) > 2_000_000:
+            _out("ask", "Hook input exceeds the inspection limit; review this operation.")
+        data = json.loads(raw)
     except Exception:
         _out(
             "ask",
@@ -140,7 +340,7 @@ def main():
     # ---- 0) Edit/Write tools on protected files (defenses, instructions, machine persistence)
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         path = (tin.get("file_path") or tin.get("notebook_path") or "").replace("\\", "/")
-        if PROTECTED_PATHS.search(path):
+        if protected_path(path, cwd):
             _out(
                 "ask",
                 "This modifies a PROTECTED file (instructions / defenses / machine persistence): "
@@ -187,7 +387,14 @@ def main():
 
     # ---- 2) Bash
     cmd = tin.get("command", "") or ""
+    if len(cmd) > 16384:
+        _out("ask", "Shell command exceeds the inspection limit; review it explicitly.")
     low = cmd.lower()
+    try:
+        command_tokens = shlex.split(cmd)
+        normalized = " ".join(command_tokens)
+    except ValueError:
+        _out("ask", "Cannot parse this shell command safely; review it explicitly.")
 
     # 2a) DENY without asking — never legitimate in a normal session (deny beats everything)
     for p, why in (
@@ -214,18 +421,8 @@ def main():
         r"\bgws\b.*\bgmail\b.*(\+send|\+reply|\+reply-all|\+forward|\b(messages|drafts)\b.*\bsend\b)|\bsendmail\b|\bmail\s+-s\b|\bmutt\b.*\s-s\b|\bhimalaya\b.*\bsend\b|osascript.*(mail|send)",
         low,
     ):
-        flag_vals = re.findall(r"--(?:to|cc|bcc)[=\s]+([^\s]+)", low)
-        rcpts = set()
-        for v in flag_vals:
-            rcpts |= set(re.findall(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", v))
-        owners = {e.lower() for e in OWNER_EMAILS}
-        if not (rcpts and rcpts <= owners):
-            ext = sorted(r for r in rcpts if r.split("@")[1] not in {e.split("@")[1] for e in owners})
-            asks.append(
-                "SENDS email (irreversible)"
-                + (f" to an EXTERNAL domain: {', '.join(ext)}" if ext else "")
-                + " — check recipients and attachments"
-            )
+        if not owner_send(cmd):
+            asks.append("SENDS email — recipients or command scope need approval")
 
     # 2c) Sharing / publishing
     for p, why in (
@@ -250,29 +447,46 @@ def main():
             asks.append(why)
 
     # 2d) Network requests that carry local data, uploads, transfers, inline network scripts, DNS
-    net_cmd = re.search(r"(^|[\s;&|(`'\"])(curl|wget|https?|http|xh|aria2c|ssh|telnet|openssl\s+s_client)\s", low)
+    net_cmd = re.search(
+        r"(^|[\s;&|(`/'\"])(curl|wget|https?|http|xh|aria2c|ssh|telnet|openssl\s+s_client)\s", normalized.lower()
+    )
+    net_cmd = net_cmd or any(
+        os.path.basename(t) in {"curl", "wget", "http", "https", "xh", "aria2c", "ssh", "telnet"}
+        for t in command_tokens
+    )
     if net_cmd:
+        if re.search(r"\s-(?:[a-zA-Z]*[FT])\S*|--(?:upload-file|form)(?:=|\s)", normalized):
+            asks.append("uploads data using an attached form/file option")
         if re.search(
             r"\s-[a-z]*d[a-z]*[\s=@'\"]|--data|--form|\s-f[\s@'\"]|\s-t[\s@'\"]|--upload-file|--json|-x\s*['\"]?(post|put|patch)|--post-data|--post-file|--body-|\s(post|put|patch)\s",
-            low,
+            normalized.lower(),
         ):
             asks.append("POSTs/uploads data over the internet")
-        if re.search(r"\$\(|`|\$\{?[a-z_][a-z0-9_]*|@[\w./~-]|<\s*[\w./~-]", low):
+        if re.search(r"\$\(|`|\$\{?[a-z_][a-z0-9_]*|@[\w./~-]|<\s*[\w./~-]", normalized.lower()):
             asks.append("puts LOCAL data into a network request (command substitution, variable, @file or stdin)")
-        if re.search(r"https?://\d{1,3}(\.\d{1,3}){3}", low):
+        if re.search(r"https?://\d{1,3}(\.\d{1,3}){3}", normalized.lower()):
             asks.append("talks to a raw IP address (no domain)")
-    if re.search(r"(python3?|node|ruby|perl|php)\s+-[ce]\s|(python3?|node)\s+-\s*<<|\bdeno\s+eval", low) and re.search(
+    if re.search(
+        r"(python3?|node|ruby|perl|php)\s+-[ce]\s|(python3?|node)\s+-\s*<<|\bdeno\s+eval", normalized.lower()
+    ) and re.search(
         r"socket|http|urllib|request|fetch|net\.|connect|smtplib|ftplib|paramiko|boto3|requests|axios|websocket|dns",
-        low,
+        normalized.lower(),
     ):
         asks.append("runs an inline script with network capability")
     if re.search(
-        r"(^|[\s;&|])(scp|sftp)\s|\brsync\b.*\S+@\S+:|\brclone\s+(copy|sync|move|copyto)|\baws\s+s3\s+(cp|sync|mv)|\bgsutil\s+(cp|rsync)|\bgcloud\s+storage\s+cp|\baz\s+storage\s+blob\s+upload|\bb2\s+upload",
-        low,
+        r"(^|[\s;&|/])(scp|sftp)\s|\brsync\b.*\S+:|\brclone\s+(copy|sync|move|copyto)|\baws\s+s3\s+(cp|sync|mv)|\bgsutil\s+(cp|rsync)|\bgcloud\s+storage\s+cp|\baz\s+storage\s+blob\s+upload|\bb2\s+upload",
+        normalized.lower(),
     ):
         asks.append("transfers files to another host/cloud")
-    if re.search(r"(^|[\s;&|])(dig|nslookup|host)\s.*(\$\(|`|\$\{?[a-z_])", low):
+    if re.search(r"(^|[\s;&|])(dig|nslookup|host)\s.*(\$\(|`|\$\{?[a-z_])", normalized.lower()):
         asks.append("builds a DNS query from local data (DNS exfiltration pattern)")
+
+    if any(os.path.basename(t) in {"scp", "sftp"} for t in command_tokens):
+        asks.append("transfers files to another host")
+    if re.search(r"\bgh\b\s+api\b", " ".join(command_tokens).lower()) and re.search(
+        r"--(?:method|field|raw-field|input)|\s-[XfF]", cmd
+    ):
+        asks.append("GitHub API request with an explicit method or payload")
 
     # 2d-bis) git operating on the ~/.claude baseline repo (evidence laundering)
     git_write = re.search(
@@ -308,34 +522,25 @@ def main():
                 break
         except OSError:
             pass
-    # 2e) git push / remotes
-    if re.search(r"\bgit\b.*\bpush\b", low):
-        if re.search(r"--force\b|--force-with-lease\b|\s-f\b", low):
-            asks.append("FORCE-PUSHES (rewrites history)")
-        try:
-            toks = shlex.split(cmd)
-        except Exception:
-            toks = cmd.split()
-        remote = "origin"
-        if "push" in toks:
-            after = [t for t in toks[toks.index("push") + 1 :] if not t.startswith("-")]
-            if after:
-                remote = after[0]
-        url = remote if "://" in remote or "@" in remote else git_remote_url(cwd, remote)
-        if not (url and ALLOWED_GIT_REMOTES.search(url)):
-            asks.append(
-                f"git push to remote '{remote}' ({url or 'unknown url'}) — not on the allowed list; pushing to a strange remote = exfiltrating the repository"
-            )
+    # 2e) Whitelisting only covers a single, fully understood push.
+    if re.search(r"\bgit\b.*\bpush\b", low, re.S) and not trusted_push(cmd, cwd):
+        asks.append("git push destination, options or command scope need approval")
     if re.search(r"\bgit\b\s+remote\s+(add|set-url)\b", low):
-        asks.append("adds/changes a git remote — verify the URL")
+        asks.append("changes a git remote — verify its effective push URLs")
 
     # 2f) Secret reads (optional)
     if GATE_SECRET_READS and re.search(
-        r"(cat|less|more|head|tail|grep|open|cp|base64|xxd|od|strings|source|\.)\s[^|;&]*(\.env\b|\.pem\b|\.p12\b|\.key\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc|\.npmrc|\.git-credentials)"
+        r"(cat|less|more|head|tail|grep|rg|sed|awk|open|cp|base64|xxd|od|strings|source|\.)\s[^|;&]*(\.env\b|\.pem\b|\.p12\b|\.key\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc|\.npmrc|\.git-credentials)"
         r"|\$\(<\s*\S*\.env|dd\s+if=\S*\.(env|pem|key)|security\s+find-(generic|internet)-password|(^|[\s;&|])(env|printenv)\s*($|\||>)",
         low,
     ):
         asks.append("READS secrets/credentials — if the next step is to send something, that is a leak")
+
+    if shell_protected_write(cmd, cwd, bool(git_write)):
+        asks.append("WRITES to protected instructions, defenses or baseline via a canonical path")
+
+    if GATE_SECRET_READS and canonical_secret_read(cmd, cwd):
+        asks.append("READS secrets/credentials through a canonical file path")
 
     # 2g) Self-modification / machine persistence via the shell (any write verb or redirect aimed at a protected path)
     if PROTECTED_IN_CMD.search(low) and (
@@ -383,15 +588,8 @@ def main():
 
     # 2i) rm / delete family — asks unless confined to ephemeral temp dirs
     if re.search(r"(^|[\s;&|/])(rm|rmdir|shred|trash)(\s|$)", cmd) or re.search(r"\bfind\b.*\s-delete\b", cmd):
-        ephemeral = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", "scratchpad", "/dev/null")
-        try:
-            tokens = shlex.split(cmd)
-        except Exception:
-            tokens = []
-        skip = {"rm", "rmdir", "shred", "trash", "find", "-delete", "&&", "||", ";", "|", "sudo"}
-        paths = [t for t in tokens if not t.startswith("-") and t not in skip]
-        if not (paths and all(any(e in p for e in ephemeral) for p in paths)):
-            asks.append("DELETES files (irreversible)")
+        if not temporary_delete(cmd, cwd):
+            asks.append("DELETES files outside a proven temporary target")
 
     # ---- decision: deny already exited above; any ask wins over allow
     if asks:

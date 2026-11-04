@@ -425,7 +425,7 @@ def test_installer_is_idempotent_and_preserves_config(tmp_path):
     log = subprocess.run(
         ["git", "-C", str(home / ".claude"), "log", "--oneline"], capture_output=True, text=True, check=False
     ).stdout
-    assert "tripwire baseline" in log
+    assert "tripwire baseline" not in log, "installation must leave baseline approval to the human"
     assert (
         subprocess.run(
             ["git", "-C", str(home / ".claude"), "remote"], capture_output=True, text=True, check=False

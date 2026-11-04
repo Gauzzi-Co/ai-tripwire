@@ -293,10 +293,14 @@ footer .wordmark{font-size:1.1rem;margin-bottom:10px}footer a{color:var(--teal)}
 # &quot;somente na nuvem&quot; — aceite, ou exclua o caminho via EXCLUDE_EXTRA=&#x27;pattern&#x27;.
 set -uo pipefail
 
-OUT_DIR=&quot;$HOME/security-scan&quot;; mkdir -p &quot;$OUT_DIR&quot;
+umask 077
+FAIL=0
+OUT_DIR=&quot;$HOME/security-scan&quot;
+if [ -L &quot;$OUT_DIR&quot; ]; then echo &quot;ERROR: report directory must not be a symlink&quot; &gt;&amp;2; exit 1; fi
+mkdir -p &quot;$OUT_DIR&quot; &amp;&amp; chmod 700 &quot;$OUT_DIR&quot; || exit 1
 STAMP=&quot;$(date +%Y-%m-%d_%H%M)&quot;
-REPORT=&quot;$OUT_DIR/report-$STAMP.txt&quot;
-LIST=&quot;$OUT_DIR/files-$STAMP.txt&quot;
+REPORT=&quot;$(mktemp &quot;$OUT_DIR/report-$STAMP-XXXXXX&quot;)&quot; || exit 1
+LIST=&quot;$(mktemp &quot;$OUT_DIR/files-$STAMP-XXXXXX&quot;)&quot; || exit 1
 MAXDEPTH=&quot;${SCAN_MAXDEPTH:-12}&quot;
 EXCLUDE_EXTRA=&quot;${EXCLUDE_EXTRA:-__none__}&quot;
 : &gt; &quot;$REPORT&quot;; : &gt; &quot;$LIST&quot;
@@ -379,7 +383,7 @@ SIGS = [
              r&quot;n[ãa]o\s+pe[çc]a\s+(permiss[ãa]o|confirma[çc][ãa]o)|dangerously-skip-permissions|bypasspermissions|\&quot;defaultmode\&quot;\s*:\s*\&quot;bypass&quot;, re.I)),
  (&quot;EXFILTRAÇÃO / envio para fora&quot;,
   re.compile(r&quot;\b(send|post|upload|forward|transmit|exfiltrate|email|envie|poste|suba|encaminhe|transmita)\b.{0,40}\b(the\s+|o\s+|a\s+|os\s+|as\s+)?(contents?|files?|\.env|env\s+file|secrets?|keys?|tokens?|credentials?|passwords?|conversation|chat\s+history|history|memory|memories|source\s+code|repo(sitory)?|conte[úu]do|arquivos?|segredos?|chaves?|senhas?|credenciais|hist[óo]rico|mem[óo]ria|c[óo]digo)\b.{0,60}\b(to|para)\b.{0,60}(https?://|@|webhook|endpoint)|&quot;
-             r&quot;!\[[^\]]*\]\(https?://[^)\s]*[?&amp;][^)\s]*\)|&quot;
+             r&quot;!\[[^\[\]\r\n]*\]\(https?://[^)?&amp;\s]*[?&amp;][^)\s]*\)|&quot;
              r&quot;webhook\.site|hooks\.slack\.com|discord(app)?\.com/api/webhooks|ngrok(-free)?\.(io|app|dev)|pastebin\.com|transfer\.sh|ntfy\.sh|api\.telegram\.org|requestbin|pipedream\.net|burpcollaborator|oastify\.com|interact\.sh|trycloudflare\.com|0x0\.st|file\.io&quot;, re.I)),
  (&quot;COLETA DE SEGREDOS&quot;,
   re.compile(r&quot;(collect|gather|read|copy|include|extract|colete|leia|copie|inclua|extraia)\b.{0,50}\b(api[_ -]?keys?|tokens?|passwords?|secrets?|credentials?|\.env\b|id_rsa|id_ed25519|private\s+key|senhas?|credenciais|chaves?\s+(de\s+)?api)\b.{0,60}\b(and|then|e|depois)\s+(send|post|upload|email|envie|poste|suba)&quot;, re.I)),
@@ -398,7 +402,28 @@ SIGS = [
 ZW = re.compile(&quot;[\u200B\u200C\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u00AD\u2028\u2029\u180E\u3164\u115F\u1160\U000E0000-\U000E007F\U000E0100-\U000E01EF]&quot;)
 EMOJI_LIKE = re.compile(&quot;[\U0001F000-\U0001FAFF\u2600-\u27BF\U0001F1E6-\U0001F1FF\uFE0F\U0001F3FB-\U0001F3FF\u200D]&quot;)
 B64 = re.compile(r&quot;(?:[A-Za-z0-9+/_-]{60,}={0,2}(?:\s*\n\s*[A-Za-z0-9+/_-]{60,}={0,2}){1,}|[A-Za-z0-9+/_-]{120,}={0,2})&quot;)
-HTMLC = re.compile(r&quot;&lt;!--.*?--&gt;|\[//\]:\s*#\s*\(.*?\)|&lt;details[^&gt;]*&gt;.*?&lt;/details&gt;&quot;, re.S | re.I)
+
+
+
+def hidden_blocks(text):
+    &quot;&quot;&quot;Forward-only paired delimiters; an unterminated opener never retries its suffix.&quot;&quot;&quot;
+    pairs = [
+        (re.compile(r&quot;&lt;!--&quot;), re.compile(r&quot;--&gt;&quot;)),
+        (re.compile(r&quot;\[//\]:[ \t]*#[ \t]*\(&quot;), re.compile(r&quot;\)&quot;)),
+        (re.compile(r&quot;&lt;details\b[^&lt;&gt;]*&gt;&quot;, re.I), re.compile(r&quot;&lt;/details\s*&gt;&quot;, re.I)),
+    ]
+    for opening, closing in pairs:
+        cursor = 0
+        while True:
+            start = opening.search(text, cursor)
+            if not start:
+                break
+            end = closing.search(text, start.end())
+            if not end:
+                yield start.start(), text[start.start():]
+                break
+            yield start.start(), text[start.start():end.end()]
+            cursor = end.end()
 
 
 def count_invisible(t):
@@ -449,11 +474,10 @@ for f in files:
         hidden += 1
         print(f&quot;  [OCULTO: {zw} caractere(s) invisível/bidi/tag] {f}  &lt;- texto invisível para humanos, legível pela IA&quot;)
     if f.lower().endswith((&quot;.md&quot;, &quot;.mdc&quot;, &quot;.txt&quot;, &quot;.cursorrules&quot;, &quot;.windsurfrules&quot;)):
-        for m in HTMLC.finditer(text):
-            body = m.group(0)
+        for position, body in hidden_blocks(text):
             if len(body) &gt; 30:
                 hidden += 1
-                print(f&quot;  [OCULTO: comentário HTML/markdown ou bloco recolhido, {len(body)} chars] {f}:{line_of(text, m.start())}\n      {body[:200].replace(chr(10), &#x27; &#x27;)}&quot;)
+                print(f&quot;  [OCULTO: comentário HTML/markdown ou bloco recolhido, {len(body)} chars] {f}:{line_of(text, position)}\n      {body[:200].replace(chr(10), &#x27; &#x27;)}&quot;)
         longl = [i for i, l in enumerate(text.splitlines(), 1) if re.search(r&quot;[ \t]{60,}\S&quot;, l) or len(l) &gt; 3000]
         if longl:
             hidden += 1
@@ -464,6 +488,7 @@ for f in files:
 print(f&quot;\n  TOTAL: {hits} assinatura(s) textual(is), {hidden} indicador(es) de conteúdo oculto.&quot;)
 print(&quot;  Falsos positivos são esperados (um hook de segurança CITA as próprias assinaturas). Assinaturas são um tripwire para payloads ingênuos, não um detector: julgue cada hit no contexto (Fase 2).&quot;)
 PYEOF
+if [ &quot;$?&quot; -ne 0 ]; then log &quot;ERROR: audit section incomplete&quot;; FAIL=1; fi
 
 # ----------------------------------------------------------- C. CONFIG / HOOKS / MCP
 hdr &quot;C. AUDITORIA DE CONFIGURAÇÃO — permissões, hooks, servidores MCP, plugins&quot;
@@ -471,29 +496,47 @@ python3 - &quot;$LIST&quot; &lt;&lt;&#x27;PYEOF&#x27; | tee -a &quot;$REPORT&quo
 import sys, json, os, re, hashlib, glob
 home = os.path.expanduser(&quot;~&quot;)
 files = [l.rstrip(&quot;\n&quot;) for l in open(sys.argv[1], encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;) if l.strip()]
+invalid = False
+def bad(label):
+    global invalid
+    invalid = True
+    print(f&quot;  INVALID configuration: {label} — audit incomplete for this value&quot;)
+def mapping(value, label):
+    if not isinstance(value, dict):
+        bad(label); return {}
+    return value
+def sequence(value, label):
+    if not isinstance(value, list):
+        bad(label); return []
+    return value
 def load(p):
-    try: return json.load(open(p, encoding=&quot;utf-8&quot;))
-    except Exception as e: return {&quot;__error__&quot;: str(e)}
+    try: return mapping(json.load(open(p, encoding=&quot;utf-8&quot;)), p)
+    except Exception as e:
+        bad(f&quot;{p}: {type(e).__name__}&quot;); return {}
 def sha(p):
     try: return hashlib.sha256(open(p,&quot;rb&quot;).read()).hexdigest()[:12]
     except Exception: return &quot;?&quot;
 settings = [p for p in files if re.search(r&quot;/\.claude/settings(\.local)?\.json$&quot;, p)]
 for p in settings:
     d = load(p); print(f&quot;\n  SETTINGS: {p}&quot;)
-    perm = d.get(&quot;permissions&quot;, {}) if isinstance(d, dict) else {}
+    perm = mapping(d.get(&quot;permissions&quot;, {}), p + &quot;.permissions&quot;)
     print(f&quot;    defaultMode: {perm.get(&#x27;defaultMode&#x27;, &#x27;(padrão)&#x27;)}&quot;)
     for k in (&quot;allow&quot;, &quot;deny&quot;, &quot;ask&quot;):
-        v = perm.get(k) or []
+        v = sequence(perm.get(k, []), p + &quot;.permissions.&quot; + k)
         if v: print(f&quot;    permissions.{k} ({len(v)}): &quot; + &quot;; &quot;.join(map(str, v))[:900])
-    broad = [r for r in (perm.get(&quot;allow&quot;) or []) if re.search(r&quot;Bash\(\*?\)|Bash\(\*\)|^Bash$|Bash\((python|bash|sh|zsh|node|curl|wget|scp|rclone|rm|eval|nc)\b|^WebFetch$|^mcp__\*|mcp__[^_]+__\*&quot;, str(r))]
+    broad = [r for r in sequence(perm.get(&quot;allow&quot;, []), p + &quot;.permissions.allow&quot;) if re.search(r&quot;Bash\(\*?\)|Bash\(\*\)|^Bash$|Bash\((python|bash|sh|zsh|node|curl|wget|scp|rclone|rm|eval|nc)\b|^WebFetch$|^mcp__\*|mcp__[^_]+__\*&quot;, str(r))]
     for k in (&quot;disableAllHooks&quot;, &quot;apiKeyHelper&quot;, &quot;enableAllProjectMcpServers&quot;, &quot;statusLine&quot;, &quot;env&quot;):
         if k in d: print(f&quot;    !! {k}: {json.dumps(d[k])[:300]}  &lt;- verify you set this (env can redirect ALL traffic: ANTHROPIC_BASE_URL)&quot;)
     if broad: print(f&quot;    !! ALLOW AMPLO (revise): {broad}&quot;)
-    hooks = d.get(&quot;hooks&quot;, {}) if isinstance(d, dict) else {}
+    hooks = mapping(d.get(&quot;hooks&quot;, {}), p + &quot;.hooks&quot;)
     for ev, entries in hooks.items():
-        for e in entries or []:
-            for h in e.get(&quot;hooks&quot;, []):
+        for e in sequence(entries, p + &quot;.hooks.&quot; + ev):
+            e = mapping(e, p + &quot;.hook entry&quot;)
+            for h in sequence(e.get(&quot;hooks&quot;, []), p + &quot;.hook commands&quot;):
+                h = mapping(h, p + &quot;.hook command&quot;)
                 cmd = h.get(&quot;command&quot;, &quot;&quot;)
+                if not isinstance(cmd, str):
+                    bad(p + &quot;.hook command string&quot;); continue
                 print(f&quot;    HOOK {ev} [{e.get(&#x27;matcher&#x27;,&#x27;*&#x27;)}]: {cmd}&quot;)
                 for path in re.findall(r&quot;(\S+\.(?:py|sh|js|ts|rb|pl))&quot;, cmd):
                     path = os.path.expandvars(path.replace(&quot;$HOME&quot;, home).replace(&quot;~&quot;, home)).strip(&#x27;&quot;\&#x27;&#x27;)
@@ -508,25 +551,29 @@ cj = os.path.join(home, &quot;.claude.json&quot;)
 if os.path.exists(cj):
     d = load(cj); print(f&quot;\n  USER CONFIG: {cj}&quot;)
     def show_mcp(servers, scope):
-        for name, cfg in (servers or {}).items():
+        for name, cfg in mapping(servers, scope + &quot;.mcpServers&quot;).items():
+            cfg = mapping(cfg, scope + &quot;.server.&quot; + name)
             tgt = cfg.get(&quot;command&quot;) or cfg.get(&quot;url&quot;) or cfg.get(&quot;httpUrl&quot;) or &quot;&quot;
-            args = re.sub(r&quot;[A-Za-z0-9_\-]{24,}&quot;, &quot;&lt;redacted&gt;&quot;, &quot; &quot;.join(map(str, cfg.get(&quot;args&quot;, []))))
+            args = re.sub(r&quot;[A-Za-z0-9_\-]{24,}&quot;, &quot;&lt;redacted&gt;&quot;, &quot; &quot;.join(map(str, sequence(cfg.get(&quot;args&quot;, []), &quot;MCP args&quot;))))
             print(f&quot;    MCP [{scope}] {name}: {tgt} {args}&quot;[:300])
-    show_mcp(d.get(&quot;mcpServers&quot;), &quot;user&quot;)
-    for proj, pd in (d.get(&quot;projects&quot;) or {}).items():
+    show_mcp(d.get(&quot;mcpServers&quot;, {}), &quot;user&quot;)
+    for proj, pd in mapping(d.get(&quot;projects&quot;, {}), cj + &quot;.projects&quot;).items():
         if isinstance(pd, dict) and pd.get(&quot;mcpServers&quot;): show_mcp(pd[&quot;mcpServers&quot;], f&quot;project {proj}&quot;)
         if isinstance(pd, dict) and pd.get(&quot;allowedTools&quot;): print(f&quot;    allowedTools [{proj}]: {pd[&#x27;allowedTools&#x27;]}&quot;[:400])
 for p in files:
     if p.endswith((&quot;.mcp.json&quot;, &quot;claude_desktop_config.json&quot;)):
         d = load(p); print(f&quot;\n  MCP FILE: {p}&quot;)
-        for name, cfg in (d.get(&quot;mcpServers&quot;) or {}).items():
-            print(f&quot;    MCP {name}: {cfg.get(&#x27;command&#x27;) or cfg.get(&#x27;url&#x27;)} {&#x27; &#x27;.join(map(str, cfg.get(&#x27;args&#x27;, [])))}&quot;[:300])
+        for name, cfg in mapping(d.get(&quot;mcpServers&quot;, {}), p + &quot;.mcpServers&quot;).items():
+            cfg = mapping(cfg, p + &quot;.server.&quot; + name)
+            print(f&quot;    MCP {name}: {cfg.get(&#x27;command&#x27;) or cfg.get(&#x27;url&#x27;)} {&#x27; &#x27;.join(map(str, sequence(cfg.get(&#x27;args&#x27;, []), &#x27;MCP args&#x27;)))}&quot;[:300])
 plug = os.path.join(home, &quot;.claude&quot;, &quot;plugins&quot;)
 if os.path.isdir(plug):
     print(f&quot;\n  PLUGINS em {plug}:&quot;)
     for root in sorted(glob.glob(os.path.join(plug, &quot;*&quot;))): print(f&quot;    {root}&quot;)
 print(&quot;\n  Revise: cada MCP/plugin/hook que você NÃO instalou conscientemente é suspeito. Hooks rodam código a cada ferramenta.&quot;)
+sys.exit(1 if invalid else 0)
 PYEOF
+if [ &quot;$?&quot; -ne 0 ]; then log &quot;ERROR: audit section incomplete&quot;; FAIL=1; fi
 
 # ------------------------------------------------- D. PERSISTÊNCIA FORA DO CLAUDE
 hdr &quot;D. PERSISTÊNCIA FORA DO CLAUDE — cron, launch agents, shell rc, git, ssh, binário&quot;
@@ -558,13 +605,22 @@ done | sort -u | tee -a &quot;$REPORT&quot; &gt;/dev/null
 
 # ------------------------------------------------- E. FORENSE DE SESSÕES
 hdr &quot;E. FORENSE DE SESSÕES — comandos de exfiltração executados nos últimos 60 dias&quot;
-PAT=&#x27;curl [^;|]*(-d ?@|--data|-F ?|-T ?|--upload-file|-X ?(POST|PUT)|--json|\\$\\(|`)|wget [^;|]*--post|gws gmail \\+(send|reply|forward)|mcp__[A-Za-z_]*(send|share|publish|post|push|upload)[A-Za-z_]*|\\bscp |\\brsync [^;|]*@|\\brclone (copy|sync|move)|aws s3 (cp|sync)|gsutil (cp|rsync)|gh gist create|webhook\\.site|hooks\\.slack\\.com|discord(app)?\\.com/api/webhooks|ngrok|pastebin\\.com|transfer\\.sh|ntfy\\.sh|api\\.telegram\\.org|dangerously-skip-permissions|base64 [^;|]*\\| *curl|/dev/tcp/&#x27;
+PAT=&#x27;curl [^;|]*(-d ?@|--data|-F ?|-T ?|--upload-file|-X ?(POST|PUT)|--json|\$\(|`)|wget [^;|]*--post|gws gmail \+(send|reply|forward)|mcp__[A-Za-z_]*(send|share|publish|post|push|upload)[A-Za-z_]*|\bscp |\brsync [^;|]*@|\brclone (copy|sync|move)|aws s3 (cp|sync)|gsutil (cp|rsync)|gh gist create|webhook\.site|hooks\.slack\.com|discord(app)?\.com/api/webhooks|ngrok|pastebin\.com|transfer\.sh|ntfy\.sh|api\.telegram\.org|dangerously-skip-permissions|base64 [^;|]*\| *curl|/dev/tcp/&#x27;
+if ! printf &#x27;&#x27; | grep -E &quot;$PAT&quot; &gt;/dev/null; then
+  # grep returns 1 for no match and 2 for an invalid pattern.
+  printf &#x27;&#x27; | grep -E &quot;$PAT&quot; &gt;/dev/null
+  RC=$?
+  if [ &quot;$RC&quot; -gt 1 ]; then log &quot;ERROR: invalid forensic pattern&quot;; exit 1; fi
+fi
 log &quot;  (esta seção varre todas as transcrições dos últimos 60 dias; em máquina pesada pode levar vários minutos — transcrições acima de 80 MB são puladas e listadas)&quot;
 if [ -d &quot;$HOME/.claude/projects&quot; ]; then
   find &quot;$HOME/.claude/projects&quot; -name &#x27;*.jsonl&#x27; -mtime -60 -size +80M 2&gt;/dev/null | sed &#x27;s/^/  PULADA (&gt;80MB, grep manual): /&#x27; | tee -a &quot;$REPORT&quot; &gt;/dev/null
   find &quot;$HOME/.claude/projects&quot; -name &#x27;*.jsonl&#x27; -mtime -60 -size -80M 2&gt;/dev/null | while IFS= read -r t; do
-    n=$(grep -cE &quot;$PAT&quot; &quot;$t&quot; 2&gt;/dev/null || true); [ &quot;${n:-0}&quot; -gt 0 ] &amp;&amp; log &quot;  $n ocorrência(s) em $t&quot; &amp;&amp; grep -oE &quot;.{0,80}($PAT).{0,120}&quot; &quot;$t&quot; | head -5 | sed &#x27;s/^/      /&#x27; | tee -a &quot;$REPORT&quot; &gt;/dev/null
-  done
+    n=$(grep -cE &quot;$PAT&quot; &quot;$t&quot;); RC=$?
+    if [ &quot;$RC&quot; -gt 1 ]; then log &quot;ERROR: cannot scan transcript $t&quot;; exit 1; fi
+    [ &quot;${n:-0}&quot; -gt 0 ] &amp;&amp; log &quot;  $n ocorrência(s) em $t&quot; &amp;&amp; grep -oE &quot;.{0,80}($PAT).{0,120}&quot; &quot;$t&quot; | head -5 | sed &#x27;s/^/      /&#x27; | tee -a &quot;$REPORT&quot; &gt;/dev/null
+    :
+  done || { log &quot;ERROR: transcript audit incomplete&quot;; exit 1; }
   log &quot;  (fim — se nada apareceu acima, nenhuma transcrição recente contém esses padrões)&quot;
 fi
 [ -f &quot;$HOME/.claude/fence-alarms.log&quot; ] &amp;&amp; { log &quot;-- Alarmes do Tripwire (fence-alarms.log, últimos 20) --&quot;; tail -20 &quot;$HOME/.claude/fence-alarms.log&quot; | sed &#x27;s/^/  /&#x27; | tee -a &quot;$REPORT&quot; &gt;/dev/null; }
@@ -578,7 +634,8 @@ log &quot;  4. Rode a Fase 2 do protocolo (revisão assistida com o Claude) usan
 log &quot;  5. NÃO apague nada ainda — mova para quarentena (é evidência). Depois rotacione segredos.&quot;
 log &quot;&quot;
 log &quot;Relatório salvo em: $REPORT&quot;
-</pre></div>
+
+exit &quot;$FAIL&quot;</pre></div>
 
   <h3>Fase 2 — Revisão assistida com o Claude, em quarentena (15 min)</h3>
   <p>Agora o Claude entra como <strong>analista</strong>. O sentido de "quarentena" é que esta sessão <strong>não consegue agir</strong> e <strong>não carrega nada que você não tenha vetado</strong> — um prompt sozinho não garante isso (seção 04), por isso a sessão é aberta em modo reduzido. Três passos:</p>
@@ -643,15 +700,16 @@ mv_q "$HOME/projeto/.claude/agents/helper.md"</pre></div></li>
   </div>
 
   <div class="callout"><div class="k">Filosofia: "ask", não "deny", e falha fechada</div>
-    <p>Quase tudo é <code>ask</code> para você continuar rápido — aprovar um envio legítimo leva um segundo, e o pedido nomeia o destinatário/destino, o que é exatamente o momento em que você percebe "eu não pedi isso". Só o que nunca é legítimo em sessão normal é <code>deny</code>. E todo hook <strong>falha fechado</strong>: se quebrar, ele grita em vez de silenciar — um portão de segurança que falha em silêncio é pior que nenhum.</p></div>
+    <p>Quase tudo é <code>ask</code> para manter a decisão humana. O gate pede aprovação em falhas tratadas; a cerca pós-ferramenta apenas avisa, sem bloquear resultados. Hooks desativados, timeouts e permissões do host continuam sendo limites separados. Nenhuma memória ou aprovação repetida cria uma exceção automaticamente.</p></div>
 
+  <p><strong>Limite:</strong> o gate pede aprovação em falhas tratadas; a cerca pós-ferramenta apenas avisa, não bloqueia resultados. Exceções cobrem comandos literais únicos, nunca autorização aprendida de memórias. Consulte o README para a semântica canônica de remotes e trabalho recorrente.</p>
   <h3>Instalação em 6 passos</h3>
   <ol>
     <li>Crie <code>~/.claude/hooks/</code> e salve lá os dois scripts abaixo mais o pequeno wrapper <code>tripwire-run.sh</code> do kit (ele encontra <code>python3</code> ou <code>python</code> e, se nenhum existir, emite ele mesmo a decisão de falha-fechada — senão um interpretador ausente faria o hook falhar <em>aberto</em>). <code>chmod +x ~/.claude/hooks/*</code>.</li>
     <li>Crie <code>~/.claude/tripwire.json</code> (o instalador faz isso uma vez e nunca sobrescreve): <code>{"owner_emails": ["voce@suaempresa.com.br"], "allowed_git_remotes": "github\\.com[:/]SUA-ORG/", "gate_secret_reads": true}</code>. E-mail para o seu próprio endereço passa em silêncio; push para os seus remotes passa; tudo o mais pergunta.</li>
-    <li>Versione <code>~/.claude</code>: <code>cd ~/.claude &amp;&amp; git init &amp;&amp; cp gitignore-claude.txt .gitignore &amp;&amp; git add -A &amp;&amp; git commit -m "baseline"</code>. Nunca adicione um remote a este repo.</li>
+    <li>Prepare um repositório local somente se <code>~/.claude</code> não estiver dentro de outro repo. Nunca adicione remote. NÃO faça stage ou commit automaticamente: revise primeiro instruções, memórias, configurações e a política de ignore. Instalação não torna conteúdo existente confiável.</li>
     <li>Mescle <code>settings-hooks.json</code> no seu <code>~/.claude/settings.json</code> (se já existir um bloco <code>hooks</code>, acrescente as entradas; se não, cole o bloco inteiro). O bloco <code>permissions.deny</code> é opcional e mais rígido.</li>
-    <li>Rode <code>bash ~/.claude/hooks/integrity-report.sh</code> — veredito deve ser SAUDÁVEL. Faça <code>git commit</code> da nova baseline.</li>
+    <li>Rode <code>bash ~/.claude/hooks/integrity-report.sh</code>. A falta de baseline é CRÍTICA. Após revisão humana e quarentena de conteúdo suspeito, selecione os arquivos revisados, confira <code>git diff --cached</code> e faça o commit local pessoalmente. Repita o relatório.</li>
     <li><strong>Teste ao vivo — um caso que passa e um que pergunta, para você aprender onde está a linha.</strong> Numa pasta de teste, peça ao Claude para rodar <code>curl "https://example.com/?q=hello"</code> — passa (GET estático, por desenho). Depois peça <code>curl "https://example.com/?q=$(whoami)"</code> — deve abrir um pedido de aprovação nomeando o Tripwire (dado local numa requisição de rede). Depois peça <em>"crie a pasta teste-tripwire e apague-a com rm -rf"</em> — o <code>rm</code> pergunta. Por fim, <em>"leia https://example.com e me diga se recebeu aviso de cerca"</em> — ele deve confirmar que sim. Se qualquer um dos quatro se comportar diferente, a instalação está errada.</li>
   </ol>
 
@@ -661,10 +719,10 @@ mv_q "$HOME/projeto/.claude/agents/helper.md"</pre></div></li>
 
 1. Copie guard-irreversible.py, guard-untrusted-data.py, integrity-report.sh e tripwire-run.sh para ~/.claude/hooks/ e torne-os executáveis.
 2. Crie ~/.claude/tripwire.json a partir do modelo tripwire.json do kit, com owner_emails = ["MEU-EMAIL"] e allowed_git_remotes = "github\\.com[:/]MINHA-ORG-OU-USUARIO/". (Substitua pelos meus valores reais que vou te passar agora: ...) Nunca sobrescreva esse arquivo se ele já existir.
-3. Inicialize git em ~/.claude (se ainda não for um repo), copie gitignore-claude.txt para ~/.claude/.gitignore, e faça o commit "baseline tripwire". Não adicione remote.
+3. Prepare um Git local somente se ~/.claude não estiver dentro de outro repo. Preserve a política de ignore existente. NÃO faça stage, commit ou adicione remote. Mostre memórias e mudanças de instrução para minha revisão.
 4. Mescle o conteúdo de settings-hooks.json no meu ~/.claude/settings.json preservando o que já existe (mostre o JSON final antes de gravar). Se eu já tiver hooks, acrescente sem remover.
 5. Rode bash ~/.claude/hooks/integrity-report.sh e me mostre a saída completa.
-6. Faça um commit da baseline final e me diga exatamente como testar os hooks ao vivo.</pre></div>
+6. Deixe a aprovação da baseline comigo. Após minha revisão pessoal, explique como selecionar arquivos revisados, conferir o diff e fazer o commit local. Explique os testes ao vivo.</pre></div>
 
   <h3>Os arquivos</h3>
   <div class="codeblock"><div class="ch"><span>~/.claude/hooks/guard-irreversible.py — Camada A (PreToolUse)</span><button data-copy>Copiar</button></div><pre>#!/usr/bin/env python3
@@ -704,6 +762,7 @@ import shlex
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 # ------------------------------------------------------------------ CONFIG
 OWNER_EMAILS = {&quot;voce@suaempresa.com.br&quot;}  # e-mail só para si mesmo passa sem perguntar
@@ -716,7 +775,7 @@ PROTECTED_PATHS = re.compile(
     r&quot;/CLAUDE(\.local)?\.md$|/MEMORY\.md$|/\.claude\.json$|/\.mcp\.json$|/claude_desktop_config\.json$|&quot;
     r&quot;/\.(zshrc|zprofile|zshenv|bashrc|bash_profile|profile|gitconfig|npmrc|netrc)$|/\.ssh/|/\.aws/|&quot;
     r&quot;/Library/LaunchAgents/|/\.config/systemd/|/\.cursor/rules/|/\.cursorrules$|/AGENTS\.md$|/copilot-instructions\.md$|/\.vscode/(settings|mcp)\.json$|&quot;
-    r&quot;/\.claude/fence-alarms\.log$|/\.claude/\.git/|/\.claude/tripwire\.json$|/\.claude/plugins/|/\.cursor/mcp\.json$|/\.codeium/|/\.windsurf/|/\.github/(instructions|prompts|agents|chatmodes)/|/\.git/hooks/&quot;,
+    r&quot;/\.claude/\.gitignore$|/\.claude/fence-alarms\.log$|/\.claude/\.git/|/\.claude/tripwire\.json$|/\.claude/plugins/|/\.cursor/mcp\.json$|/\.codeium/|/\.windsurf/|/\.github/(instructions|prompts|agents|chatmodes)/|/\.git/hooks/&quot;,
     re.I,
 )
 PROTECTED_IN_CMD = re.compile(
@@ -729,7 +788,7 @@ PROTECTED_IN_CMD = re.compile(
 )
 # Commands that can write/replace a file (a protected path + one of these = self-modification).
 WRITE_VERBS = re.compile(
-    r&quot;(^|[\s;&amp;|(`])(mv|cp|tee|ln|install|rsync|truncate|touch|chmod|chown|chflags|dd|patch|unlink|shred|&quot;
+    r&quot;(^|[\s;&amp;|(`/])(rm|rmdir|mv|cp|tee|ln|install|rsync|truncate|touch|chmod|chown|chflags|dd|patch|unlink|shred|&quot;
     r&quot;sed\s+-[a-z]*i|perl\s+-[a-z]*i|python3?\s+-c|node\s+-e|ruby\s+-e|perl\s+-e|php\s+-r|&quot;
     r&quot;git\s+(checkout|restore|apply|stash)|chattr|curl\s.*\s-o\s|wget\s.*\s-O\s)&quot;,
     re.I,
@@ -741,12 +800,19 @@ _CONFIG_ERROR = &quot;&quot;
 try:
     with open(os.path.expanduser(&quot;~/.claude/tripwire.json&quot;), encoding=&quot;utf-8&quot;) as _cf:
         _cfg = json.load(_cf)
-    if isinstance(_cfg.get(&quot;owner_emails&quot;), list) and _cfg[&quot;owner_emails&quot;]:
-        OWNER_EMAILS = {str(e) for e in _cfg[&quot;owner_emails&quot;]}
-    if isinstance(_cfg.get(&quot;allowed_git_remotes&quot;), str) and _cfg[&quot;allowed_git_remotes&quot;]:
-        ALLOWED_GIT_REMOTES = re.compile(_cfg[&quot;allowed_git_remotes&quot;], re.I)
-    if isinstance(_cfg.get(&quot;gate_secret_reads&quot;), bool):
-        GATE_SECRET_READS = _cfg[&quot;gate_secret_reads&quot;]
+    if not isinstance(_cfg, dict):
+        raise ValueError(&quot;config must be an object&quot;)
+    _owners = _cfg.get(&quot;owner_emails&quot;, list(OWNER_EMAILS))
+    _remotes = _cfg.get(&quot;allowed_git_remotes&quot;, ALLOWED_GIT_REMOTES.pattern)
+    _reads = _cfg.get(&quot;gate_secret_reads&quot;, GATE_SECRET_READS)
+    if not isinstance(_owners, list) or not all(
+        isinstance(e, str) and re.fullmatch(r&quot;[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}&quot;, e) for e in _owners
+    ):
+        raise ValueError(&quot;owner_emails must be a list of literal addresses&quot;)
+    if not isinstance(_remotes, str) or not _remotes or not isinstance(_reads, bool):
+        raise ValueError(&quot;invalid gate configuration&quot;)
+    _compiled = re.compile(_remotes, re.I)
+    OWNER_EMAILS, ALLOWED_GIT_REMOTES, GATE_SECRET_READS = set(_owners), _compiled, _reads
 except FileNotFoundError:
     pass
 except (
@@ -776,25 +842,217 @@ def deny(reason):
 
 
 def allow():
+    if _CONFIG_ERROR:
+        _out(&quot;ask&quot;, _CONFIG_ERROR + &quot;Repair the configuration before using policy exceptions.&quot;)
     sys.exit(0)
 
 
-def git_remote_url(cwd, remote):
+def path_forms(path, cwd):
+    &quot;&quot;&quot;Check lexical names and symlink targets without executing shell expansion.&quot;&quot;&quot;
+    path = path.replace(&quot;\\&quot;, &quot;/&quot;).replace(&quot;${HOME}&quot;, os.path.expanduser(&quot;~&quot;)).replace(&quot;$HOME&quot;, os.path.expanduser(&quot;~&quot;))
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    return {os.path.normpath(path), os.path.realpath(path)}
+
+
+def protected_path(path, cwd):
+    return any(
+        PROTECTED_PATHS.search(p)
+        or PROTECTED_PATHS.search(p.rstrip(&quot;/&quot;) + &quot;/&quot;)
+        or p.rstrip(&quot;/&quot;).lower().endswith(&quot;/.claude&quot;)
+        for p in path_forms(path, cwd)
+    )
+
+
+def literal_command(cmd):
+    &quot;&quot;&quot;Exceptions apply only to one static command, never to shell programs.&quot;&quot;&quot;
+    quote = None
+    for char in cmd:
+        if quote == &quot;&#x27;&quot;:
+            if char == &quot;&#x27;&quot;:
+                quote = None
+            continue
+        if char == &#x27;&quot;&#x27; and quote in {None, &#x27;&quot;&#x27;}:
+            quote = None if quote else &#x27;&quot;&#x27;
+            continue
+        if char == &quot;&#x27;&quot; and quote is None:
+            quote = &quot;&#x27;&quot;
+            continue
+        if char in &quot;$&quot; + chr(96) + &quot;\\\n\r&quot; or (quote is None and char in &quot;;&amp;|&lt;&gt;(){}*?[]#&quot;):
+            return []
     try:
-        return subprocess.run(
-            [&quot;git&quot;, &quot;-C&quot;, cwd, &quot;remote&quot;, &quot;get-url&quot;, remote],
+        return shlex.split(cmd)
+    except ValueError:
+        return []
+
+
+def owner_send(cmd):
+    args = literal_command(cmd)
+    if args[:3] != [&quot;gws&quot;, &quot;gmail&quot;, &quot;+send&quot;]:
+        return False
+    recipients = []
+    i = 3
+    while i &lt; len(args):
+        flag, eq, value = args[i].partition(&quot;=&quot;)
+        if flag not in {&quot;--to&quot;, &quot;--cc&quot;, &quot;--bcc&quot;, &quot;--subject&quot;, &quot;--body&quot;}:
+            return False
+        if not eq:
+            i += 1
+            if i &gt;= len(args):
+                return False
+            value = args[i]
+        if flag in {&quot;--to&quot;, &quot;--cc&quot;, &quot;--bcc&quot;}:
+            parts = value.split(&quot;,&quot;)
+            if not all(re.fullmatch(r&quot;[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}&quot;, p) for p in parts):
+                return False
+            recipients.extend(p.lower() for p in parts)
+        i += 1
+    return bool(recipients) and set(recipients) &lt;= {e.lower() for e in OWNER_EMAILS}
+
+
+def trusted_remote(url):
+    &quot;&quot;&quot;A trusted host mentioned in an attacker path is not a trusted authority.&quot;&quot;&quot;
+    if re.search(r&quot;[\s\\%?#]&quot;, url):
+        return False
+    if &quot;://&quot; in url:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {&quot;ssh&quot;, &quot;https&quot;} or not parsed.hostname or parsed.port:
+            return False
+        if parsed.password or (parsed.scheme == &quot;https&quot; and parsed.username):
+            return False
+        host, path = parsed.hostname, parsed.path.lstrip(&quot;/&quot;)
+    else:
+        match = re.fullmatch(r&quot;(?:git@)?([a-zA-Z0-9.-]+):([^\s:]+)&quot;, url)
+        if not match:
+            return False
+        host, path = match.groups()
+    if any(p in {&quot;&quot;, &quot;.&quot;, &quot;..&quot;} for p in path.split(&quot;/&quot;)):
+        return False
+    return bool(ALLOWED_GIT_REMOTES.match(host.lower() + &quot;/&quot; + path))
+
+
+def trusted_push(cmd, cwd):
+    args = literal_command(cmd)
+    # Implicit defaults, context overrides, direct URLs and push flags need approval.
+    if len(args) &lt; 3 or args[:2] != [&quot;git&quot;, &quot;push&quot;]:
+        return False
+    remote = args[2]
+    if not re.fullmatch(r&quot;[a-zA-Z0-9_][a-zA-Z0-9._-]*&quot;, remote):
+        return False
+    if any(arg.startswith((&quot;-&quot;, &quot;+&quot;, &quot;:&quot;)) for arg in args[3:]):
+        return False
+    try:
+        result = subprocess.run(
+            [&quot;git&quot;, &quot;-C&quot;, cwd, &quot;remote&quot;, &quot;get-url&quot;, &quot;--push&quot;, &quot;--all&quot;, remote],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
-        ).stdout.strip()
-    except Exception:
-        return &quot;&quot;
+        )
+        urls = result.stdout.splitlines()
+        return result.returncode == 0 and bool(urls) and all(trusted_remote(url) for url in urls)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+def temporary_delete(cmd, cwd):
+    args = literal_command(cmd)
+    if not args or os.path.basename(args[0]) not in {&quot;rm&quot;, &quot;rmdir&quot;}:
+        return False
+    paths = []
+    options = True
+    for arg in args[1:]:
+        if options and arg == &quot;--&quot;:
+            options = False
+        elif options and arg.startswith(&quot;-&quot;):
+            continue
+        else:
+            paths.append(arg)
+    roots = {os.path.realpath(p) for p in (&quot;/tmp&quot;, &quot;/private/tmp&quot;, &quot;/var/folders&quot;, &quot;/private/var/folders&quot;)}
+    return bool(paths) and all(
+        os.path.isabs(p)
+        and not protected_path(p, cwd)
+        and any(os.path.realpath(p).startswith(root + &quot;/&quot;) for root in roots)
+        for p in paths
+    )
+
+
+def shell_protected_write(cmd, cwd, git_mutation=False):
+    &quot;&quot;&quot;Conservative canonical targets and possible cd contexts, not a shell sandbox.&quot;&quot;&quot;
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=&quot;;&amp;|()&lt;&gt;&quot;)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    if len(tokens) &gt; 256:
+        return True
+    contexts = {os.path.realpath(cwd)}
+    for i, tok in enumerate(tokens[:-1]):
+        if tok in {&quot;cd&quot;, &quot;pushd&quot;}:
+            j = i + 1
+            while j &lt; len(tokens) and tokens[j] in {&quot;-L&quot;, &quot;-P&quot;, &quot;-e&quot;}:
+                j += 1
+            if j &lt; len(tokens) and tokens[j] == &quot;--&quot;:
+                j += 1
+            destination = tokens[j] if j &lt; len(tokens) and tokens[j] not in {&quot;;&quot;, &quot;&amp;&amp;&quot;, &quot;||&quot;, &quot;|&quot;, &quot;)&quot;} else &quot;~&quot;
+            if destination.startswith(&quot;-&quot;):
+                return True  # directory-stack state is not available to the hook
+            for base in list(contexts):
+                contexts.update(path_forms(destination, base))
+                if len(contexts) &gt; 8:
+                    return True
+    if git_mutation and any(&quot;/.claude/&quot; in base.lower() or base.lower().endswith(&quot;/.claude&quot;) for base in contexts):
+        return True
+    # Downloads are writes too; retain attached/long option values as destinations.
+    if any(os.path.basename(token) in {&quot;curl&quot;, &quot;wget&quot;} for token in tokens):
+        for i, token in enumerate(tokens):
+            if token in {&quot;--remote-name&quot;, &quot;--remote-name-all&quot;, &quot;--remote-header-name&quot;, &quot;-O&quot;, &quot;-J&quot;}:
+                return True  # destination determined by the remote, not a reviewed literal
+            target = None
+            if token in {&quot;-o&quot;, &quot;-O&quot;, &quot;--output&quot;, &quot;--output-document&quot;, &quot;--output-dir&quot;, &quot;--directory-prefix&quot;, &quot;-P&quot;}:
+                target = tokens[i + 1] if i + 1 &lt; len(tokens) else &quot;&quot;
+            elif token.startswith((&quot;--output=&quot;, &quot;--output-document=&quot;, &quot;--output-dir=&quot;, &quot;--directory-prefix=&quot;)):
+                target = token.split(&quot;=&quot;, 1)[1]
+            elif token.startswith((&quot;-o&quot;, &quot;-O&quot;, &quot;-P&quot;)) and len(token) &gt; 2:
+                target = token[2:]
+            if target is not None and (not target or any(protected_path(target, base) for base in contexts)):
+                return True
+    for i, tok in enumerate(tokens[:-1]):
+        if &quot;&gt;&quot; in tok and set(tok) &lt;= set(&quot;&lt;&gt;&amp;|&quot;):
+            if any(protected_path(tokens[i + 1], base) for base in contexts):
+                return True
+    if WRITE_VERBS.search(&quot; &quot;.join(tokens)) or git_mutation:
+        return any(
+            protected_path(token.split(&quot;=&quot;, 1)[-1], base)
+            for token in tokens
+            for base in contexts
+            if token and token not in {&quot;;&quot;, &quot;&amp;&amp;&quot;, &quot;||&quot;, &quot;|&quot;}
+        )
+    return False
+
+
+def canonical_secret_read(cmd, cwd):
+    if not re.search(r&quot;(^|[\s;&amp;|/])(cat|less|more|head|tail|grep|rg|sed|awk|cp|base64|xxd|od|strings)\s&quot;, cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return True
+    secrets = re.compile(
+        r&quot;(^|/)(\.env(?:\.[^/]*)?|id_rsa|id_ed25519|\.netrc|\.npmrc|\.git-credentials)$|/\.aws/credentials$|\.(pem|p12|key)$&quot;,
+        re.I,
+    )
+    return any(secrets.search(p) for token in tokens for p in path_forms(token, cwd))
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
+        raw = sys.stdin.read(2_000_001)
+        if len(raw) &gt; 2_000_000:
+            _out(&quot;ask&quot;, &quot;Hook input exceeds the inspection limit; review this operation.&quot;)
+        data = json.loads(raw)
     except Exception:
         _out(
             &quot;ask&quot;,
@@ -809,7 +1067,7 @@ def main():
     # ---- 0) Edit/Write tools on protected files (defenses, instructions, machine persistence)
     if tool in (&quot;Write&quot;, &quot;Edit&quot;, &quot;MultiEdit&quot;, &quot;NotebookEdit&quot;):
         path = (tin.get(&quot;file_path&quot;) or tin.get(&quot;notebook_path&quot;) or &quot;&quot;).replace(&quot;\\&quot;, &quot;/&quot;)
-        if PROTECTED_PATHS.search(path):
+        if protected_path(path, cwd):
             _out(
                 &quot;ask&quot;,
                 &quot;Isto modifica um arquivo PROTEGIDO (instruções / defesas / persistência da máquina): &quot;
@@ -859,7 +1117,14 @@ def main():
 
     # ---- 2) Bash
     cmd = tin.get(&quot;command&quot;, &quot;&quot;) or &quot;&quot;
+    if len(cmd) &gt; 16384:
+        _out(&quot;ask&quot;, &quot;Shell command exceeds the inspection limit; review it explicitly.&quot;)
     low = cmd.lower()
+    try:
+        command_tokens = shlex.split(cmd)
+        normalized = &quot; &quot;.join(command_tokens)
+    except ValueError:
+        _out(&quot;ask&quot;, &quot;Cannot parse this shell command safely; review it explicitly.&quot;)
 
     # 2a) DENY without asking — never legitimate in a normal session (deny beats everything)
     for p, why in (
@@ -889,18 +1154,8 @@ def main():
         r&quot;\bgws\b.*\bgmail\b.*(\+send|\+reply|\+reply-all|\+forward|\b(messages|drafts)\b.*\bsend\b)|\bsendmail\b|\bmail\s+-s\b|\bmutt\b.*\s-s\b|\bhimalaya\b.*\bsend\b|osascript.*(mail|send)&quot;,
         low,
     ):
-        flag_vals = re.findall(r&quot;--(?:to|cc|bcc)[=\s]+([^\s]+)&quot;, low)
-        rcpts = set()
-        for v in flag_vals:
-            rcpts |= set(re.findall(r&quot;[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}&quot;, v))
-        owners = {e.lower() for e in OWNER_EMAILS}
-        if not (rcpts and rcpts &lt;= owners):
-            ext = sorted(r for r in rcpts if r.split(&quot;@&quot;)[1] not in {e.split(&quot;@&quot;)[1] for e in owners})
-            asks.append(
-                &quot;ENVIA e-mail (irreversível)&quot;
-                + (f&quot; para domínio EXTERNO: {&#x27;, &#x27;.join(ext)}&quot; if ext else &quot;&quot;)
-                + &quot; — confira destinatários e anexos&quot;
-            )
+        if not owner_send(cmd):
+            asks.append(&quot;SENDS email — recipients or command scope need approval&quot;)
 
     # 2c) Sharing / publishing
     for p, why in (
@@ -925,31 +1180,48 @@ def main():
             asks.append(why)
 
     # 2d) Network requests that carry local data, uploads, transfers, inline network scripts, DNS
-    net_cmd = re.search(r&quot;(^|[\s;&amp;|(`&#x27;\&quot;])(curl|wget|https?|http|xh|aria2c|ssh|telnet|openssl\s+s_client)\s&quot;, low)
+    net_cmd = re.search(
+        r&quot;(^|[\s;&amp;|(`/&#x27;\&quot;])(curl|wget|https?|http|xh|aria2c|ssh|telnet|openssl\s+s_client)\s&quot;, normalized.lower()
+    )
+    net_cmd = net_cmd or any(
+        os.path.basename(t) in {&quot;curl&quot;, &quot;wget&quot;, &quot;http&quot;, &quot;https&quot;, &quot;xh&quot;, &quot;aria2c&quot;, &quot;ssh&quot;, &quot;telnet&quot;}
+        for t in command_tokens
+    )
     if net_cmd:
+        if re.search(r&quot;\s-(?:[a-zA-Z]*[FT])\S*|--(?:upload-file|form)(?:=|\s)&quot;, normalized):
+            asks.append(&quot;uploads data using an attached form/file option&quot;)
         if re.search(
             r&quot;\s-[a-z]*d[a-z]*[\s=@&#x27;\&quot;]|--data|--form|\s-f[\s@&#x27;\&quot;]|\s-t[\s@&#x27;\&quot;]|--upload-file|--json|-x\s*[&#x27;\&quot;]?(post|put|patch)|--post-data|--post-file|--body-|\s(post|put|patch)\s&quot;,
-            low,
+            normalized.lower(),
         ):
             asks.append(&quot;faz POST/upload de dados pela internet&quot;)
-        if re.search(r&quot;\$\(|`|\$\{?[a-z_][a-z0-9_]*|@[\w./~-]|&lt;\s*[\w./~-]&quot;, low):
+        if re.search(r&quot;\$\(|`|\$\{?[a-z_][a-z0-9_]*|@[\w./~-]|&lt;\s*[\w./~-]&quot;, normalized.lower()):
             asks.append(
                 &quot;coloca dado LOCAL numa requisição de rede (substituição de comando, variável, @arquivo ou stdin)&quot;
             )
-        if re.search(r&quot;https?://\d{1,3}(\.\d{1,3}){3}&quot;, low):
+        if re.search(r&quot;https?://\d{1,3}(\.\d{1,3}){3}&quot;, normalized.lower()):
             asks.append(&quot;fala com um endereço IP cru (sem domínio)&quot;)
-    if re.search(r&quot;(python3?|node|ruby|perl|php)\s+-[ce]\s|(python3?|node)\s+-\s*&lt;&lt;|\bdeno\s+eval&quot;, low) and re.search(
+    if re.search(
+        r&quot;(python3?|node|ruby|perl|php)\s+-[ce]\s|(python3?|node)\s+-\s*&lt;&lt;|\bdeno\s+eval&quot;, normalized.lower()
+    ) and re.search(
         r&quot;socket|http|urllib|request|fetch|net\.|connect|smtplib|ftplib|paramiko|boto3|requests|axios|websocket|dns&quot;,
-        low,
+        normalized.lower(),
     ):
         asks.append(&quot;roda um script inline com capacidade de rede&quot;)
     if re.search(
-        r&quot;(^|[\s;&amp;|])(scp|sftp)\s|\brsync\b.*\S+@\S+:|\brclone\s+(copy|sync|move|copyto)|\baws\s+s3\s+(cp|sync|mv)|\bgsutil\s+(cp|rsync)|\bgcloud\s+storage\s+cp|\baz\s+storage\s+blob\s+upload|\bb2\s+upload&quot;,
-        low,
+        r&quot;(^|[\s;&amp;|/])(scp|sftp)\s|\brsync\b.*\S+:|\brclone\s+(copy|sync|move|copyto)|\baws\s+s3\s+(cp|sync|mv)|\bgsutil\s+(cp|rsync)|\bgcloud\s+storage\s+cp|\baz\s+storage\s+blob\s+upload|\bb2\s+upload&quot;,
+        normalized.lower(),
     ):
         asks.append(&quot;transfere arquivos para outro host/nuvem&quot;)
-    if re.search(r&quot;(^|[\s;&amp;|])(dig|nslookup|host)\s.*(\$\(|`|\$\{?[a-z_])&quot;, low):
+    if re.search(r&quot;(^|[\s;&amp;|])(dig|nslookup|host)\s.*(\$\(|`|\$\{?[a-z_])&quot;, normalized.lower()):
         asks.append(&quot;monta uma consulta DNS com dado local (padrão de exfiltração por DNS)&quot;)
+
+    if any(os.path.basename(t) in {&quot;scp&quot;, &quot;sftp&quot;} for t in command_tokens):
+        asks.append(&quot;transfers files to another host&quot;)
+    if re.search(r&quot;\bgh\b\s+api\b&quot;, &quot; &quot;.join(command_tokens).lower()) and re.search(
+        r&quot;--(?:method|field|raw-field|input)|\s-[XfF]&quot;, cmd
+    ):
+        asks.append(&quot;GitHub API request with an explicit method or payload&quot;)
 
     # 2d-bis) git operating on the ~/.claude baseline repo (evidence laundering)
     git_write = re.search(
@@ -985,34 +1257,25 @@ def main():
                 break
         except OSError:
             pass
-    # 2e) git push / remotes
-    if re.search(r&quot;\bgit\b.*\bpush\b&quot;, low):
-        if re.search(r&quot;--force\b|--force-with-lease\b|\s-f\b&quot;, low):
-            asks.append(&quot;faz FORCE-PUSH (reescreve histórico)&quot;)
-        try:
-            toks = shlex.split(cmd)
-        except Exception:
-            toks = cmd.split()
-        remote = &quot;origin&quot;
-        if &quot;push&quot; in toks:
-            after = [t for t in toks[toks.index(&quot;push&quot;) + 1 :] if not t.startswith(&quot;-&quot;)]
-            if after:
-                remote = after[0]
-        url = remote if &quot;://&quot; in remote or &quot;@&quot; in remote else git_remote_url(cwd, remote)
-        if not (url and ALLOWED_GIT_REMOTES.search(url)):
-            asks.append(
-                f&quot;git push to remote &#x27;{remote}&#x27; ({url or &#x27;url desconhecida&#x27;}) — fora da lista permitida; push para um remote estranho = exfiltração do repositório&quot;
-            )
+    # 2e) Whitelisting only covers a single, fully understood push.
+    if re.search(r&quot;\bgit\b.*\bpush\b&quot;, low, re.S) and not trusted_push(cmd, cwd):
+        asks.append(&quot;git push destination, options or command scope need approval&quot;)
     if re.search(r&quot;\bgit\b\s+remote\s+(add|set-url)\b&quot;, low):
-        asks.append(&quot;adiciona/altera um remote git — verifique a URL&quot;)
+        asks.append(&quot;changes a git remote — verify its effective push URLs&quot;)
 
     # 2f) Secret reads (optional)
     if GATE_SECRET_READS and re.search(
-        r&quot;(cat|less|more|head|tail|grep|open|cp|base64|xxd|od|strings|source|\.)\s[^|;&amp;]*(\.env\b|\.pem\b|\.p12\b|\.key\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc|\.npmrc|\.git-credentials)&quot;
+        r&quot;(cat|less|more|head|tail|grep|rg|sed|awk|open|cp|base64|xxd|od|strings|source|\.)\s[^|;&amp;]*(\.env\b|\.pem\b|\.p12\b|\.key\b|id_rsa|id_ed25519|\.aws/credentials|\.netrc|\.npmrc|\.git-credentials)&quot;
         r&quot;|\$\(&lt;\s*\S*\.env|dd\s+if=\S*\.(env|pem|key)|security\s+find-(generic|internet)-password|(^|[\s;&amp;|])(env|printenv)\s*($|\||&gt;)&quot;,
         low,
     ):
         asks.append(&quot;LÊ segredos/credenciais — se o próximo passo for enviar algo, isso é vazamento&quot;)
+
+    if shell_protected_write(cmd, cwd, bool(git_write)):
+        asks.append(&quot;WRITES to protected instructions, defenses or baseline via a canonical path&quot;)
+
+    if GATE_SECRET_READS and canonical_secret_read(cmd, cwd):
+        asks.append(&quot;READS secrets/credentials through a canonical file path&quot;)
 
     # 2g) Self-modification / machine persistence via the shell (any write verb or redirect aimed at a protected path)
     if PROTECTED_IN_CMD.search(low) and (
@@ -1063,15 +1326,8 @@ def main():
 
     # 2i) rm / delete family — asks unless confined to ephemeral temp dirs
     if re.search(r&quot;(^|[\s;&amp;|/])(rm|rmdir|shred|trash)(\s|$)&quot;, cmd) or re.search(r&quot;\bfind\b.*\s-delete\b&quot;, cmd):
-        ephemeral = (&quot;/tmp/&quot;, &quot;/private/tmp/&quot;, &quot;/var/folders/&quot;, &quot;/private/var/folders/&quot;, &quot;scratchpad&quot;, &quot;/dev/null&quot;)
-        try:
-            tokens = shlex.split(cmd)
-        except Exception:
-            tokens = []
-        skip = {&quot;rm&quot;, &quot;rmdir&quot;, &quot;shred&quot;, &quot;trash&quot;, &quot;find&quot;, &quot;-delete&quot;, &quot;&amp;&amp;&quot;, &quot;||&quot;, &quot;;&quot;, &quot;|&quot;, &quot;sudo&quot;}
-        paths = [t for t in tokens if not t.startswith(&quot;-&quot;) and t not in skip]
-        if not (paths and all(any(e in p for e in ephemeral) for p in paths)):
-            asks.append(&quot;APAGA arquivos (irreversível)&quot;)
+        if not temporary_delete(cmd, cwd):
+            asks.append(&quot;DELETES files outside a proven temporary target&quot;)
 
     # ---- decision: deny already exited above; any ask wins over allow
     if asks:
@@ -1094,8 +1350,7 @@ except Exception as e:
     _out(
         &quot;ask&quot;,
         f&quot;guard-irreversible QUEBROU ({type(e).__name__}: {e}) — FALHANDO FECHADO. Aprove conscientemente ou conserte/desative o hook no settings.json.&quot;,
-    )
-</pre></div>
+    )</pre></div>
   <div class="codeblock"><div class="ch"><span>~/.claude/hooks/guard-untrusted-data.py — Camada B (PostToolUse)</span><button data-copy>Copiar</button></div><pre>#!/usr/bin/env python3
 &quot;&quot;&quot;
 guard-untrusted-data.py — AI Tripwire · Layer B (PostToolUse) · edição open-source Gauzzi &amp; Co v1.1
@@ -1115,7 +1370,7 @@ instructions), the notice escalates, names what it saw, and records the evidence
 headlines about AI no longer trip it: it now requires an instruction addressed to the assistant
 (&quot;you must run…&quot;, &quot;assistant: send…&quot;), not merely the words &quot;AI&quot; and &quot;open&quot; in one sentence.
 
-FAILS CLOSED: if the hook breaks, it announces &quot;fence is DOWN&quot; instead of staying silent. This
+FAILS LOUD: if the hook breaks, it announces &quot;fence is DOWN&quot; instead of staying silent. This
 hook never blocks a tool result — it only adds context.
 
 Install: ~/.claude/hooks/guard-untrusted-data.py + the &quot;hooks&quot; block in settings.json
@@ -1126,9 +1381,9 @@ import datetime
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
-import time
 
 OWNER = &quot;o usuário&quot;  # como o Claude deve se referir a você nos avisos
 
@@ -1162,7 +1417,7 @@ BASH_UNTRUSTED = re.compile(
 # Files read from disk that commonly carry instructions written by third parties
 INSTRUCTION_FILES = re.compile(
     r&quot;(readme|contributing|changelog|claude(\.local)?\.md|agents\.md|gemini\.md|skill\.md|\.cursorrules|\.windsurfrules|copilot-instructions\.md|\.mdc$&quot;
-    r&quot;|/node_modules/|/vendor/|/site-packages/|/\.claude/(agents|commands|skills|plugins)/)&quot;,
+    r&quot;|memory\.md|/node_modules/|/vendor/|/site-packages/|/\.claude/(agents|commands|skills|plugins|rules|memory)/|/\.claude/projects/[^/]+/memory/|/\.github/(instructions|prompts|agents|chatmodes)/)&quot;,
     re.I,
 )
 
@@ -1208,7 +1463,7 @@ SIGNATURES = [
         &quot;instrução de exfiltração&quot;,
     ),
     (
-        re.compile(r&quot;!\[[^\]]*\]\(https?://[^)\s]*[?&amp;][^)\s]*\)&quot;, re.I),
+        re.compile(r&quot;!\[[^\[\]\r\n]*\]\(https?://[^)?&amp;\s]*[?&amp;][^)\s]*\)&quot;, re.I),
         &quot;padrão de exfiltração por imagem-GET (imagem markdown com parâmetros de query)&quot;,
     ),
 ]
@@ -1233,9 +1488,21 @@ def suspicious_invisible(text):
     return False
 
 
+def instruction_path(path, cwd):
+    path = os.path.expanduser(path.replace(&quot;\\&quot;, &quot;/&quot;))
+    path = path if os.path.isabs(path) else os.path.join(cwd, path)
+    return any(
+        INSTRUCTION_FILES.search(p) or INSTRUCTION_FILES.search(p.rstrip(&quot;/&quot;) + &quot;/&quot;)
+        for p in (os.path.normpath(path), os.path.realpath(path))
+    )
+
+
 def main():
     try:
-        data = json.load(sys.stdin)
+        raw = sys.stdin.read(2_000_001)
+        if len(raw) &gt; 2_000_000:
+            emit(BANNER + &quot; &quot; + FAIL_NOTICE + &quot; Input exceeds the inspection limit.&quot;)
+        data = json.loads(raw)
     except Exception:
         emit(FAIL_NOTICE)
 
@@ -1243,11 +1510,20 @@ def main():
     tin = data.get(&quot;tool_input&quot;, {}) or {}
     cmd = tin.get(&quot;command&quot;, &quot;&quot;) or &quot;&quot;
 
+    cwd = data.get(&quot;cwd&quot;) or os.getcwd()
     fenced = bool(INTERNET_TOOLS.search(tool))
     if not fenced and tool == &quot;Bash&quot;:
-        fenced = bool(BASH_UNTRUSTED.search(cmd))
+        fenced = bool(BASH_UNTRUSTED.search(cmd) or INSTRUCTION_FILES.search(cmd))
+        if not fenced:
+            try:
+                tokens = shlex.split(cmd)
+                fenced = instruction_path(&quot;.&quot;, cwd) or any(instruction_path(token, cwd) for token in tokens[:256])
+                if len(tokens) &gt; 256:
+                    fenced = True
+            except ValueError:
+                fenced = True
     if not fenced and tool == &quot;Read&quot;:
-        fenced = bool(INSTRUCTION_FILES.search((tin.get(&quot;file_path&quot;) or &quot;&quot;).replace(&quot;\\&quot;, &quot;/&quot;)))
+        fenced = instruction_path(tin.get(&quot;file_path&quot;) or &quot;&quot;, cwd)
     if not fenced:
         sys.exit(0)
 
@@ -1257,6 +1533,9 @@ def main():
     except Exception:
         resp_text = str(resp)
 
+    # Keep signature work bounded; the fence itself still applies to the entire output.
+    limited = len(resp_text) &gt; 262144
+    resp_text = resp_text[:262144]
     alarms_detail = []
     for rx, label in SIGNATURES:
         m = rx.search(resp_text)
@@ -1267,6 +1546,8 @@ def main():
         alarms_detail.append((&quot;unicode invisível/bidi/tag&quot;, &quot;(caracteres não imprimíveis presentes no conteúdo)&quot;))
     alarms = sorted(label for label, _ in alarms_detail)
     ctx = BANNER
+    if limited:
+        ctx += &quot; Signature scan limited to 262144 characters; the remainder is still UNTRUSTED.&quot;
     if alarms:
         ctx += (
             &quot; \U0001f6a8 ALARME: este conteúdo bateu com assinaturas de injeção (&quot;
@@ -1276,19 +1557,7 @@ def main():
         # Local forensic evidence (never synced): an alarm must never be unanswerable after the fact.
         try:
             log_path = os.path.expanduser(&quot;~/.claude/fence-alarms.log&quot;)
-            fingerprint = f&quot;{tool}|{&#x27;,&#x27;.join(alarms)}|{str(tin.get(&#x27;url&#x27;) or tin.get(&#x27;query&#x27;) or tin.get(&#x27;file_path&#x27;) or &#x27;&#x27;)[:120]}&quot;
-            state = os.path.expanduser(&quot;~/.claude/.fence-last-alarm&quot;)
-            try:
-                last = open(state, encoding=&quot;utf-8&quot;).read().split(&quot;\t&quot;, 1)
-                if len(last) == 2 and last[1] == fingerprint and (time.time() - float(last[0])) &lt; 60:
-                    emit(ctx)  # same alarm within a minute: context yes, duplicate log line no
-            except Exception:
-                pass
-            try:
-                with open(state, &quot;w&quot;, encoding=&quot;utf-8&quot;) as sf:
-                    sf.write(f&quot;{time.time()}\t{fingerprint}&quot;)
-            except Exception:
-                pass
+            # Never let agent-writable suppression state discard durable evidence.
             try:  # mirror to the OS unified log — the agent cannot erase it without sudo
                 subprocess.run(
                     [&quot;logger&quot;, &quot;-t&quot;, &quot;tripwire&quot;, f&quot;ALARM tool={tool} sig={&#x27;,&#x27;.join(alarms)}&quot;], timeout=2, check=False
@@ -1323,8 +1592,7 @@ try:
 except SystemExit:
     raise
 except Exception:
-    emit(FAIL_NOTICE)
-</pre></div>
+    emit(FAIL_NOTICE)</pre></div>
   <div class="codeblock short"><div class="ch"><span>settings-hooks.json — bloco para mesclar em ~/.claude/settings.json</span><button data-copy>Copiar</button></div><pre>{
   &quot;permissions&quot;: {
     &quot;deny&quot;: [
@@ -1341,7 +1609,7 @@ except Exception:
   &quot;hooks&quot;: {
     &quot;PreToolUse&quot;: [
       {
-        &quot;matcher&quot;: &quot;Bash|Write|Edit|MultiEdit|NotebookEdit|Artifact|mcp__.*&quot;,
+        &quot;matcher&quot;: &quot;Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|Artifact|mcp__.*&quot;,
         &quot;hooks&quot;: [
           {
             &quot;type&quot;: &quot;command&quot;,
@@ -1364,8 +1632,7 @@ except Exception:
       }
     ]
   }
-}
-</pre></div>
+}</pre></div>
   <div class="codeblock short"><div class="ch"><span>~/.claude/hooks/tripwire-run.sh — wrapper que resolve o interpretador (falha fechada se não houver python)</span><button data-copy>Copiar</button></div><pre>#!/usr/bin/env bash
 # tripwire-run.sh — interpreter-resolving wrapper for the AI Tripwire hooks.
 # Claude Code treats a hook command that cannot start (e.g. `python3` not on PATH: Windows ships
@@ -1386,15 +1653,13 @@ case &quot;$HOOK&quot; in
   *)
     printf &#x27;{&quot;hookSpecificOutput&quot;:{&quot;hookEventName&quot;:&quot;PreToolUse&quot;,&quot;permissionDecision&quot;:&quot;ask&quot;,&quot;permissionDecisionReason&quot;:&quot;Tripwire: python interpreter or hook file not found (%s) — FAILING CLOSED. Approve consciously, then fix ~/.claude/hooks.&quot;}}&#x27; &quot;$HOOK&quot; ;;
 esac
-exit 0
-</pre></div>
+exit 0</pre></div>
   <div class="codeblock short"><div class="ch"><span>~/.claude/tripwire.json — sua configuração (criada uma vez, nunca sobrescrita)</span><button data-copy>Copiar</button></div><pre>{
   &quot;_comment&quot;: &quot;Configuração do AI Tripwire — lida por ~/.claude/hooks/guard-irreversible.py a cada chamada. Upgrades nunca sobrescrevem este arquivo.&quot;,
   &quot;owner_emails&quot;: [&quot;voce@suaempresa.com.br&quot;],
   &quot;allowed_git_remotes&quot;: &quot;github\\.com[:/](SUA-ORG|seu-usuario)/&quot;,
   &quot;gate_secret_reads&quot;: true
-}
-</pre></div>
+}</pre></div>
   <div class="codeblock short"><div class="ch"><span>~/.claude/.gitignore — Camada C (baseline versionada)</span><button data-copy>Copiar</button></div><pre># ~/.claude/.gitignore — versiona SÓ a superfície de defesa e as memórias (tamper-evident).
 # Tudo o mais (transcrições, caches, tokens) fica de fora — nunca suba este repo para a nuvem.
 *
@@ -1418,8 +1683,7 @@ exit 0
 !projects/
 !projects/*/
 !projects/*/memory/
-!projects/*/memory/**
-</pre></div>
+!projects/*/memory/**</pre></div>
   <div class="codeblock"><div class="ch"><span>~/.claude/hooks/integrity-report.sh — rotina semanal</span><button data-copy>Copiar</button></div><pre>#!/usr/bin/env bash
 # integrity-report.sh — AI Tripwire · relatório semanal de integridade · edição cliente v1.0
 # Verifica que as defesas existem, estão registradas e falham fechado; mostra o que mudou
@@ -1428,16 +1692,19 @@ exit 0
 # Pré-requisito: ~/.claude versionado com git (ver documento, seção Tripwire › passo 3).
 set -uo pipefail
 CLAUDE_DIR=&quot;$HOME/.claude&quot;; FAIL=0
+DEFENSES=(.gitignore settings.json settings.local.json tripwire.json hooks/ agents/ commands/ skills/ plugins/ rules/ memory/ CLAUDE.md CLAUDE.local.md &#x27;:(glob)projects/*/memory/**&#x27;)
+INSTRUCTIONS=(rules/ memory/ agents/ commands/ skills/ CLAUDE.md CLAUDE.local.md &#x27;:(glob)projects/*/memory/**&#x27;)
 echo &quot;== RELATÓRIO DE INTEGRIDADE TRIPWIRE — $(date &#x27;+%Y-%m-%d %H:%M %Z&#x27;) ==&quot;
 
 echo; echo &quot;-- Binário claude (alias/função na frente do binário = vetor) --&quot;
 type claude 2&gt;&amp;1 | head -2
 
 echo; echo &quot;-- Changelog das defesas (git, últimas 10 mudanças) --&quot;
-if git -C &quot;$CLAUDE_DIR&quot; rev-parse --is-inside-work-tree &gt;/dev/null 2&gt;&amp;1; then
-  git -C &quot;$CLAUDE_DIR&quot; log --oneline -10
+TOP=&quot;$(git -C &quot;$CLAUDE_DIR&quot; rev-parse --show-toplevel 2&gt;/dev/null || true)&quot;
+if [ &quot;$TOP&quot; = &quot;$(cd &quot;$CLAUDE_DIR&quot; 2&gt;/dev/null &amp;&amp; pwd -P)&quot; ] &amp;&amp; git -C &quot;$CLAUDE_DIR&quot; rev-parse --verify HEAD &gt;/dev/null 2&gt;&amp;1; then
+  if ! git -C &quot;$CLAUDE_DIR&quot; log --oneline -10; then echo &quot;CRITICAL: cannot inspect baseline log&quot;; FAIL=1; fi
   echo; echo &quot;-- Mudanças NÃO commitadas na superfície de defesa --&quot;
-  CH=&quot;$(git -C &quot;$CLAUDE_DIR&quot; status --porcelain -- settings.json hooks/ agents/ commands/ skills/ CLAUDE.md 2&gt;/dev/null)&quot;
+  if ! CH=&quot;$(git -C &quot;$CLAUDE_DIR&quot; status --porcelain --ignored -uall -- &quot;${DEFENSES[@]}&quot; 2&gt;/dev/null)&quot;; then echo &quot;CRITICAL: cannot inspect defense status&quot;; FAIL=1; fi
   if [ -n &quot;$CH&quot; ]; then echo &quot;$CH&quot;; echo &quot;^ defesas alteradas sem commit — se você não fez isso, INVESTIGUE antes de commitar.&quot;; else echo &quot;limpo.&quot;; fi
 else
   echo &quot;CRÍTICO: ~/.claude não é um repositório git — sem baseline, sem detecção de adulteração.&quot;; FAIL=1
@@ -1459,23 +1726,67 @@ done
 
 echo; echo &quot;-- Permissões perigosas no settings --&quot;
 for SF in &quot;$CLAUDE_DIR/settings.json&quot; &quot;$CLAUDE_DIR/settings.local.json&quot;; do [ -f &quot;$SF&quot; ] || continue; echo &quot;  ($SF)&quot;
-python3 - &quot;$SF&quot; &lt;&lt;&#x27;PYEOF&#x27;
-import json, sys, re
-try: d = json.load(open(sys.argv[1]))
-except Exception as e: print(&quot;  (não consegui ler settings.json:&quot;, e, &quot;)&quot;); sys.exit(0)
-p = d.get(&quot;permissions&quot;, {})
-if p.get(&quot;defaultMode&quot;) in (&quot;bypassPermissions&quot;,): print(&quot;  CRÍTICO: defaultMode = bypassPermissions&quot;)
-bad = [r for r in p.get(&quot;allow&quot;, []) if re.search(r&quot;^Bash$|Bash\(\*?\)|Bash\(\*\)|curl|wget|scp|rclone|\brm\b&quot;, str(r))]
-print(&quot;  allow amplo:&quot;, bad if bad else &quot;nenhum&quot;)
-if d.get(&quot;disableAllHooks&quot;): print(&quot;  CRITICAL: disableAllHooks is set — every hook is off&quot;)
-hk = d.get(&quot;hooks&quot;, {}) or {}
-pre = [e for e in hk.get(&quot;PreToolUse&quot;, []) if any(&quot;guard-irreversible&quot; in (h.get(&quot;command&quot;) or &quot;&quot;) for h in e.get(&quot;hooks&quot;, []))]
-if pre and not any(re.search(r&quot;Bash&quot;, e.get(&quot;matcher&quot;, &quot;&quot;)) for e in pre): print(&quot;  CRITICAL: guard-irreversible is registered but its matcher does not cover Bash&quot;)
+if ! python3 - &quot;$SF&quot; &lt;&lt;&#x27;PYEOF&#x27;
+import json, sys, re, os
+failed = False
+def critical(message):
+    global failed
+    print(&quot;  CRITICAL: &quot; + message)
+    failed = True
+try:
+    with open(sys.argv[1], encoding=&quot;utf-8&quot;) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError(&quot;settings must be an object&quot;)
+    p = d.get(&quot;permissions&quot;, {})
+    if not isinstance(p, dict):
+        raise ValueError(&quot;permissions must be an object&quot;)
+    if p.get(&quot;defaultMode&quot;) == &quot;bypassPermissions&quot;:
+        critical(&quot;defaultMode = bypassPermissions&quot;)
+    rules = p.get(&quot;allow&quot;, [])
+    if not isinstance(rules, list):
+        raise ValueError(&quot;permissions.allow must be a list&quot;)
+    bad = [r for r in rules if re.search(r&quot;^Bash$|Bash\(\*?\)|curl|wget|scp|rclone|\brm\b&quot;, str(r))]
+    print(&quot;  broad allow rules:&quot;, bad or &quot;none&quot;)
+    if d.get(&quot;disableAllHooks&quot;):
+        critical(&quot;disableAllHooks is set&quot;)
+    if os.path.basename(sys.argv[1]) == &quot;settings.json&quot; or &quot;hooks&quot; in d:
+        hooks = d.get(&quot;hooks&quot;, {})
+        if not isinstance(hooks, dict):
+            raise ValueError(&quot;hooks must be an object&quot;)
+        requirements = {
+            &quot;PreToolUse&quot;: (&quot;guard-irreversible.py&quot;, [&quot;Bash&quot;, &quot;Write&quot;, &quot;Edit&quot;, &quot;MultiEdit&quot;, &quot;NotebookEdit&quot;, &quot;WebFetch&quot;, &quot;Artifact&quot;, &quot;mcp__test__send&quot;]),
+            &quot;PostToolUse&quot;: (&quot;guard-untrusted-data.py&quot;, [&quot;Bash&quot;, &quot;Read&quot;, &quot;WebFetch&quot;, &quot;WebSearch&quot;, &quot;mcp__test__read&quot;]),
+        }
+        for event, (script, tools) in requirements.items():
+            entries = hooks.get(event, [])
+            if not isinstance(entries, list):
+                raise ValueError(&quot;hook event must be a list&quot;)
+            covered = set()
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get(&quot;hooks&quot;), list):
+                    raise ValueError(&quot;invalid hook registration&quot;)
+                matcher = entry.get(&quot;matcher&quot;, &quot;&quot;)
+                rx = re.compile(matcher or &quot;.*&quot;)
+                for hook in entry[&quot;hooks&quot;]:
+                    if not isinstance(hook, dict):
+                        raise ValueError(&quot;invalid hook command&quot;)
+                    expected = &#x27;bash &quot;$HOME/.claude/hooks/tripwire-run.sh&quot; &#x27; + script
+                    # A filename mentioned in an echo/comment is not an installed hook.
+                    if hook.get(&quot;type&quot;) == &quot;command&quot; and hook.get(&quot;command&quot;) == expected and not hook.get(&quot;async&quot;):
+                        covered.update(t for t in tools if rx.fullmatch(t))
+            missing = sorted(set(tools) - covered)
+            if missing:
+                critical(event + &quot; missing effective Tripwire coverage: &quot; + &quot;, &quot;.join(missing))
+except Exception as e:
+    critical(&quot;invalid/unreadable settings: &quot; + type(e).__name__)
+sys.exit(1 if failed else 0)
 PYEOF
+then FAIL=1; fi
 done
 
 echo; echo &quot;-- Drift de memórias/instruções desde a baseline --&quot;
-DRIFT=&quot;$(git -C &quot;$CLAUDE_DIR&quot; status --porcelain -uall -- projects/ CLAUDE.md 2&gt;/dev/null || true)&quot;
+if ! DRIFT=&quot;$(git -C &quot;$CLAUDE_DIR&quot; status --porcelain --ignored -uall -- &quot;${INSTRUCTIONS[@]}&quot; 2&gt;/dev/null)&quot;; then echo &quot;CRITICAL: cannot inspect instruction status&quot;; FAIL=1; fi
 if [ -n &quot;$DRIFT&quot; ]; then
   echo &quot;$DRIFT&quot; | sed &#x27;s/^/  /&#x27;
   echo &quot;$DRIFT&quot; | grep -q &#x27;^.D&#x27; &amp;&amp; echo &quot;  NOTA: há deleções — confirme cada uma (envenenamento também pode ser apagamento).&quot;
@@ -1483,10 +1794,22 @@ if [ -n &quot;$DRIFT&quot; ]; then
 else echo &quot;  limpo — nenhuma mudança.&quot;; fi
 
 echo; echo &quot;-- Tripwire de envenenamento (assinaturas SÓ no conteúdo novo) --&quot;
-TMPF=&quot;$(mktemp)&quot;
-{ git -C &quot;$CLAUDE_DIR&quot; diff HEAD -- projects/ CLAUDE.md 2&gt;/dev/null | grep &#x27;^+&#x27; | grep -v &#x27;^+++&#x27; || true
-  git -C &quot;$CLAUDE_DIR&quot; ls-files --others --exclude-standard -- projects/ 2&gt;/dev/null | while IFS= read -r f; do cat &quot;$CLAUDE_DIR/$f&quot; 2&gt;/dev/null; done
-} &gt; &quot;$TMPF&quot;
+TMPF=&quot;$(mktemp)&quot; || exit 1
+DIFF_FILE=&quot;$(mktemp)&quot; || exit 1
+LIST_FILE=&quot;$(mktemp)&quot; || exit 1
+trap &#x27;rm -f &quot;$TMPF&quot; &quot;$DIFF_FILE&quot; &quot;$LIST_FILE&quot;&#x27; EXIT
+if ! git -C &quot;$CLAUDE_DIR&quot; -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD -- &quot;${INSTRUCTIONS[@]}&quot; &gt; &quot;$DIFF_FILE&quot;; then
+  echo &quot;CRITICAL: cannot inspect instruction diff&quot;; FAIL=1
+fi
+grep &#x27;^+&#x27; &quot;$DIFF_FILE&quot; | grep -v &#x27;^+++&#x27; &gt; &quot;$TMPF&quot; || true
+if ! git -C &quot;$CLAUDE_DIR&quot; ls-files --others -z -- &quot;${INSTRUCTIONS[@]}&quot; &gt; &quot;$LIST_FILE&quot;; then
+  echo &quot;CRITICAL: cannot inventory new instructions&quot;; FAIL=1
+fi
+while IFS= read -r -d &#x27;&#x27; f; do
+  if ! cat &quot;$CLAUDE_DIR/$f&quot; &gt;&gt; &quot;$TMPF&quot;; then
+    echo &quot;CRITICAL: cannot read new instruction content&quot;; FAIL=1
+  fi
+done &lt; &quot;$LIST_FILE&quot;
 if [ ! -s &quot;$TMPF&quot; ]; then echo &quot;  sem conteúdo novo para escanear.&quot;; else
 HITS=&quot;$(python3 - &quot;$TMPF&quot; &lt;&lt;&#x27;PYEOF&#x27;
 import sys, re
@@ -1504,6 +1827,7 @@ for rx, label in sigs:
     if m: print(f&quot;{label}: ...{t[max(0,m.start()-40):m.end()+40]!r}...&quot;)
 PYEOF
 )&quot;
+if [ &quot;$?&quot; -ne 0 ]; then echo &quot;CRITICAL: instruction signature check failed&quot;; FAIL=1; fi
 if [ -n &quot;$HITS&quot; ]; then echo &quot;  CRÍTICO: assinatura(s) em conteúdo NOVO — NÃO commite baseline; rode o protocolo de varredura:&quot;; echo &quot;$HITS&quot; | sed &#x27;s/^/    /&#x27;; FAIL=1
 else echo &quot;  OK    nenhuma assinatura no conteúdo novo.&quot;; fi; fi
 rm -f &quot;$TMPF&quot;
@@ -1511,8 +1835,7 @@ rm -f &quot;$TMPF&quot;
 [ -f &quot;$CLAUDE_DIR/fence-alarms.log&quot; ] &amp;&amp; { echo; echo &quot;-- Alarmes da cerca (últimos 10) --&quot;; tail -10 &quot;$CLAUDE_DIR/fence-alarms.log&quot; | sed &#x27;s/^/  /&#x27;; }
 
 echo; [ &quot;$FAIL&quot; -eq 0 ] &amp;&amp; echo &quot;VEREDITO: SAUDÁVEL&quot; || echo &quot;VEREDITO: PROBLEMAS CRÍTICOS — aja agora&quot;
-exit &quot;$FAIL&quot;
-</pre></div>
+exit &quot;$FAIL&quot;</pre></div>
 
   <h3>Como o hook decide (para você adaptar)</h3>
   <p>O Claude Code entrega ao hook um JSON pela entrada padrão com <code>tool_name</code>, <code>tool_input</code> (o comando, o caminho, os argumentos) e <code>cwd</code>. O hook responde com um JSON <code>hookSpecificOutput</code> contendo <code>permissionDecision</code> (<code>allow</code> / <code>ask</code> / <code>deny</code>) e um <code>permissionDecisionReason</code> que aparece no seu pedido de aprovação — ou, no PostToolUse, um <code>additionalContext</code> que é injetado no contexto do modelo. Cada gate é uma expressão regular sobre o texto do comando; para endurecer, troque <code>ask(</code> por <code>deny(</code> na linha correspondente. Para acrescentar um canal (por exemplo, um CLI interno da sua empresa), adicione um par <code>(regex, motivo)</code> na lista certa.</p>

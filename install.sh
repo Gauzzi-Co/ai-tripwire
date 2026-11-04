@@ -4,10 +4,10 @@
 # What it does:  copies the hooks + the interpreter wrapper, writes ~/.claude/tripwire.json ONCE (your
 #                config: owner e-mails, allowed git remotes) and never overwrites it on upgrades, merges
 #                the hooks + deny rules into ~/.claude/settings.json (backup first), creates a LOCAL git
-#                baseline in ~/.claude — only if ~/.claude is not already inside another repository —
+#                repository in ~/.claude — only if not already inside another repository —
 #                and runs the integrity report.
 # What it never does: add a git remote, call the network, commit into a repository it did not create,
-#                or touch anything outside ~/.claude.
+#                trust existing memories by committing a baseline, or touch anything outside ~/.claude.
 set -euo pipefail
 
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/kit" && pwd)"
@@ -59,10 +59,17 @@ for event, entries in add["hooks"].items():
     if not isinstance(have, list):
         have = []
         hooks[event] = have
-    existing = {h.get("command") for e in have if isinstance(e, dict) for h in e.get("hooks", []) if isinstance(h, dict)}
-    for e in entries:
-        if not all(h.get("command") in existing for h in e["hooks"]):
-            have.append(e)
+    # Replace only owned hook commands so upgrades refresh matchers/timeouts too.
+    owned = {h["command"] for e in entries for h in e["hooks"]}
+    kept = []
+    for e in have:
+        if not isinstance(e, dict) or not isinstance(e.get("hooks"), list):
+            raise SystemExit("ERROR: malformed existing hooks; repair settings before upgrading")
+        remaining = [h for h in e["hooks"] if not isinstance(h, dict) or h.get("command") not in owned]
+        if remaining:
+            kept.append(dict(e, hooks=remaining))
+    hooks[event] = kept + entries
+
 perm = cur.get("permissions")
 if not isinstance(perm, dict):
     perm = {}
@@ -91,21 +98,23 @@ else
   if [ -z "$TOP" ]; then
     git -C "$CLAUDE" init -q
   fi
-  cp "$KIT/gitignore-claude.txt" "$CLAUDE/.gitignore"
-  git -C "$CLAUDE" add -A
-  if git -C "$CLAUDE" -c user.name="tripwire" -c user.email="tripwire@localhost" commit -qm "tripwire baseline $(date +%F)"; then
-    echo "   committed baseline"
-  else
-    echo "   nothing new to commit"
+  if [ ! -e "$CLAUDE/.gitignore" ]; then
+    cp "$KIT/gitignore-claude.txt" "$CLAUDE/.gitignore"
   fi
+  echo "   REVIEW REQUIRED: no files staged or committed. Existing memory is NOT trusted."
+  echo "   Review instructions, memories, settings and the .gitignore before creating a baseline yourself."
+
 fi
 
 echo "5/5 integrity report"
-bash "$HOOKS/integrity-report.sh" || true
+if ! bash "$HOOKS/integrity-report.sh"; then
+  echo "INSTALL COMPLETE, REVIEW REQUIRED: integrity is not healthy yet; do not accept a baseline blindly."
+fi
 
 cat <<EOF
 
 Next:
+  - Review existing memory/instructions and the full local diff before manually committing any baseline.
   - Edit $CONFIG: "owner_emails" (mail to yourself passes silently) and "allowed_git_remotes" (regex).
   - Optional hardening: chmod 444 $HOOKS/*.py   (macOS: chflags uchg $HOOKS/*.py)
     and make the alarm log append-only (macOS: chflags uappnd $CLAUDE/fence-alarms.log — undo with nouappnd)

@@ -2,6 +2,24 @@
 
 All notable changes to AI Tripwire. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [Unreleased]
+
+### Security corrections
+
+- Register WebFetch before execution, refresh owned registrations on upgrades, and validate effective event/matcher coverage.
+- Canonicalize protected paths and symlink targets; cover redirects, baseline Git directory options and additional secret readers.
+- Limit self-email, Git and temporary-delete exceptions to understood operations. Check every effective push URL against a canonical host/path; do not inherit an exception across shell commands.
+- Gate absolute/attached upload forms, remote rsync targets and GitHub API mutations.
+- Bound post-tool signature work, fix nested-markdown matching, fence rule/memory reads and persist every alarm without trusting writable deduplication state.
+- Report disabled/malformed hook settings as failures; include rules, policy and ignored new instruction content in integrity reporting.
+- Make transcript patterns portable, keep auditing after malformed config, and create private, unique scanner output.
+- Never stage or commit a baseline during installation or upgrades. Human review is required before accepting existing memory.
+- Add isolated regressions for both editions, Linux/macOS CI, and tests keeping executable protocol examples in sync.
+
+### Limits
+
+Hooks remain a defense-in-depth layer, not an OS sandbox. The post-tool fence is advisory. A general, securely enrolled recurring-workflow registry is not part of this patch; repeated approvals and memory content never create grants automatically.
+
 ## [1.1.0] — 2026-09-05
 
 First public release. Before publishing, the kit went through five independent adversarial reviews

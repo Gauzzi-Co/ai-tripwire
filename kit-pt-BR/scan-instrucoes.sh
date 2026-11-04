@@ -20,10 +20,14 @@
 # "somente na nuvem" — aceite, ou exclua o caminho via EXCLUDE_EXTRA='pattern'.
 set -uo pipefail
 
-OUT_DIR="$HOME/security-scan"; mkdir -p "$OUT_DIR"
+umask 077
+FAIL=0
+OUT_DIR="$HOME/security-scan"
+if [ -L "$OUT_DIR" ]; then echo "ERROR: report directory must not be a symlink" >&2; exit 1; fi
+mkdir -p "$OUT_DIR" && chmod 700 "$OUT_DIR" || exit 1
 STAMP="$(date +%Y-%m-%d_%H%M)"
-REPORT="$OUT_DIR/report-$STAMP.txt"
-LIST="$OUT_DIR/files-$STAMP.txt"
+REPORT="$(mktemp "$OUT_DIR/report-$STAMP-XXXXXX")" || exit 1
+LIST="$(mktemp "$OUT_DIR/files-$STAMP-XXXXXX")" || exit 1
 MAXDEPTH="${SCAN_MAXDEPTH:-12}"
 EXCLUDE_EXTRA="${EXCLUDE_EXTRA:-__none__}"
 : > "$REPORT"; : > "$LIST"
@@ -106,7 +110,7 @@ SIGS = [
              r"n[ãa]o\s+pe[çc]a\s+(permiss[ãa]o|confirma[çc][ãa]o)|dangerously-skip-permissions|bypasspermissions|\"defaultmode\"\s*:\s*\"bypass", re.I)),
  ("EXFILTRAÇÃO / envio para fora",
   re.compile(r"\b(send|post|upload|forward|transmit|exfiltrate|email|envie|poste|suba|encaminhe|transmita)\b.{0,40}\b(the\s+|o\s+|a\s+|os\s+|as\s+)?(contents?|files?|\.env|env\s+file|secrets?|keys?|tokens?|credentials?|passwords?|conversation|chat\s+history|history|memory|memories|source\s+code|repo(sitory)?|conte[úu]do|arquivos?|segredos?|chaves?|senhas?|credenciais|hist[óo]rico|mem[óo]ria|c[óo]digo)\b.{0,60}\b(to|para)\b.{0,60}(https?://|@|webhook|endpoint)|"
-             r"!\[[^\]]*\]\(https?://[^)\s]*[?&][^)\s]*\)|"
+             r"!\[[^\[\]\r\n]*\]\(https?://[^)?&\s]*[?&][^)\s]*\)|"
              r"webhook\.site|hooks\.slack\.com|discord(app)?\.com/api/webhooks|ngrok(-free)?\.(io|app|dev)|pastebin\.com|transfer\.sh|ntfy\.sh|api\.telegram\.org|requestbin|pipedream\.net|burpcollaborator|oastify\.com|interact\.sh|trycloudflare\.com|0x0\.st|file\.io", re.I)),
  ("COLETA DE SEGREDOS",
   re.compile(r"(collect|gather|read|copy|include|extract|colete|leia|copie|inclua|extraia)\b.{0,50}\b(api[_ -]?keys?|tokens?|passwords?|secrets?|credentials?|\.env\b|id_rsa|id_ed25519|private\s+key|senhas?|credenciais|chaves?\s+(de\s+)?api)\b.{0,60}\b(and|then|e|depois)\s+(send|post|upload|email|envie|poste|suba)", re.I)),
@@ -125,7 +129,28 @@ SIGS = [
 ZW = re.compile("[\u200B\u200C\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u00AD\u2028\u2029\u180E\u3164\u115F\u1160\U000E0000-\U000E007F\U000E0100-\U000E01EF]")
 EMOJI_LIKE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\U0001F1E6-\U0001F1FF\uFE0F\U0001F3FB-\U0001F3FF\u200D]")
 B64 = re.compile(r"(?:[A-Za-z0-9+/_-]{60,}={0,2}(?:\s*\n\s*[A-Za-z0-9+/_-]{60,}={0,2}){1,}|[A-Za-z0-9+/_-]{120,}={0,2})")
-HTMLC = re.compile(r"<!--.*?-->|\[//\]:\s*#\s*\(.*?\)|<details[^>]*>.*?</details>", re.S | re.I)
+
+
+
+def hidden_blocks(text):
+    """Forward-only paired delimiters; an unterminated opener never retries its suffix."""
+    pairs = [
+        (re.compile(r"<!--"), re.compile(r"-->")),
+        (re.compile(r"\[//\]:[ \t]*#[ \t]*\("), re.compile(r"\)")),
+        (re.compile(r"<details\b[^<>]*>", re.I), re.compile(r"</details\s*>", re.I)),
+    ]
+    for opening, closing in pairs:
+        cursor = 0
+        while True:
+            start = opening.search(text, cursor)
+            if not start:
+                break
+            end = closing.search(text, start.end())
+            if not end:
+                yield start.start(), text[start.start():]
+                break
+            yield start.start(), text[start.start():end.end()]
+            cursor = end.end()
 
 
 def count_invisible(t):
@@ -176,11 +201,10 @@ for f in files:
         hidden += 1
         print(f"  [OCULTO: {zw} caractere(s) invisível/bidi/tag] {f}  <- texto invisível para humanos, legível pela IA")
     if f.lower().endswith((".md", ".mdc", ".txt", ".cursorrules", ".windsurfrules")):
-        for m in HTMLC.finditer(text):
-            body = m.group(0)
+        for position, body in hidden_blocks(text):
             if len(body) > 30:
                 hidden += 1
-                print(f"  [OCULTO: comentário HTML/markdown ou bloco recolhido, {len(body)} chars] {f}:{line_of(text, m.start())}\n      {body[:200].replace(chr(10), ' ')}")
+                print(f"  [OCULTO: comentário HTML/markdown ou bloco recolhido, {len(body)} chars] {f}:{line_of(text, position)}\n      {body[:200].replace(chr(10), ' ')}")
         longl = [i for i, l in enumerate(text.splitlines(), 1) if re.search(r"[ \t]{60,}\S", l) or len(l) > 3000]
         if longl:
             hidden += 1
@@ -191,6 +215,7 @@ for f in files:
 print(f"\n  TOTAL: {hits} assinatura(s) textual(is), {hidden} indicador(es) de conteúdo oculto.")
 print("  Falsos positivos são esperados (um hook de segurança CITA as próprias assinaturas). Assinaturas são um tripwire para payloads ingênuos, não um detector: julgue cada hit no contexto (Fase 2).")
 PYEOF
+if [ "$?" -ne 0 ]; then log "ERROR: audit section incomplete"; FAIL=1; fi
 
 # ----------------------------------------------------------- C. CONFIG / HOOKS / MCP
 hdr "C. AUDITORIA DE CONFIGURAÇÃO — permissões, hooks, servidores MCP, plugins"
@@ -198,29 +223,47 @@ python3 - "$LIST" <<'PYEOF' | tee -a "$REPORT"
 import sys, json, os, re, hashlib, glob
 home = os.path.expanduser("~")
 files = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8", errors="replace") if l.strip()]
+invalid = False
+def bad(label):
+    global invalid
+    invalid = True
+    print(f"  INVALID configuration: {label} — audit incomplete for this value")
+def mapping(value, label):
+    if not isinstance(value, dict):
+        bad(label); return {}
+    return value
+def sequence(value, label):
+    if not isinstance(value, list):
+        bad(label); return []
+    return value
 def load(p):
-    try: return json.load(open(p, encoding="utf-8"))
-    except Exception as e: return {"__error__": str(e)}
+    try: return mapping(json.load(open(p, encoding="utf-8")), p)
+    except Exception as e:
+        bad(f"{p}: {type(e).__name__}"); return {}
 def sha(p):
     try: return hashlib.sha256(open(p,"rb").read()).hexdigest()[:12]
     except Exception: return "?"
 settings = [p for p in files if re.search(r"/\.claude/settings(\.local)?\.json$", p)]
 for p in settings:
     d = load(p); print(f"\n  SETTINGS: {p}")
-    perm = d.get("permissions", {}) if isinstance(d, dict) else {}
+    perm = mapping(d.get("permissions", {}), p + ".permissions")
     print(f"    defaultMode: {perm.get('defaultMode', '(padrão)')}")
     for k in ("allow", "deny", "ask"):
-        v = perm.get(k) or []
+        v = sequence(perm.get(k, []), p + ".permissions." + k)
         if v: print(f"    permissions.{k} ({len(v)}): " + "; ".join(map(str, v))[:900])
-    broad = [r for r in (perm.get("allow") or []) if re.search(r"Bash\(\*?\)|Bash\(\*\)|^Bash$|Bash\((python|bash|sh|zsh|node|curl|wget|scp|rclone|rm|eval|nc)\b|^WebFetch$|^mcp__\*|mcp__[^_]+__\*", str(r))]
+    broad = [r for r in sequence(perm.get("allow", []), p + ".permissions.allow") if re.search(r"Bash\(\*?\)|Bash\(\*\)|^Bash$|Bash\((python|bash|sh|zsh|node|curl|wget|scp|rclone|rm|eval|nc)\b|^WebFetch$|^mcp__\*|mcp__[^_]+__\*", str(r))]
     for k in ("disableAllHooks", "apiKeyHelper", "enableAllProjectMcpServers", "statusLine", "env"):
         if k in d: print(f"    !! {k}: {json.dumps(d[k])[:300]}  <- verify you set this (env can redirect ALL traffic: ANTHROPIC_BASE_URL)")
     if broad: print(f"    !! ALLOW AMPLO (revise): {broad}")
-    hooks = d.get("hooks", {}) if isinstance(d, dict) else {}
+    hooks = mapping(d.get("hooks", {}), p + ".hooks")
     for ev, entries in hooks.items():
-        for e in entries or []:
-            for h in e.get("hooks", []):
+        for e in sequence(entries, p + ".hooks." + ev):
+            e = mapping(e, p + ".hook entry")
+            for h in sequence(e.get("hooks", []), p + ".hook commands"):
+                h = mapping(h, p + ".hook command")
                 cmd = h.get("command", "")
+                if not isinstance(cmd, str):
+                    bad(p + ".hook command string"); continue
                 print(f"    HOOK {ev} [{e.get('matcher','*')}]: {cmd}")
                 for path in re.findall(r"(\S+\.(?:py|sh|js|ts|rb|pl))", cmd):
                     path = os.path.expandvars(path.replace("$HOME", home).replace("~", home)).strip('"\'')
@@ -235,25 +278,29 @@ cj = os.path.join(home, ".claude.json")
 if os.path.exists(cj):
     d = load(cj); print(f"\n  USER CONFIG: {cj}")
     def show_mcp(servers, scope):
-        for name, cfg in (servers or {}).items():
+        for name, cfg in mapping(servers, scope + ".mcpServers").items():
+            cfg = mapping(cfg, scope + ".server." + name)
             tgt = cfg.get("command") or cfg.get("url") or cfg.get("httpUrl") or ""
-            args = re.sub(r"[A-Za-z0-9_\-]{24,}", "<redacted>", " ".join(map(str, cfg.get("args", []))))
+            args = re.sub(r"[A-Za-z0-9_\-]{24,}", "<redacted>", " ".join(map(str, sequence(cfg.get("args", []), "MCP args"))))
             print(f"    MCP [{scope}] {name}: {tgt} {args}"[:300])
-    show_mcp(d.get("mcpServers"), "user")
-    for proj, pd in (d.get("projects") or {}).items():
+    show_mcp(d.get("mcpServers", {}), "user")
+    for proj, pd in mapping(d.get("projects", {}), cj + ".projects").items():
         if isinstance(pd, dict) and pd.get("mcpServers"): show_mcp(pd["mcpServers"], f"project {proj}")
         if isinstance(pd, dict) and pd.get("allowedTools"): print(f"    allowedTools [{proj}]: {pd['allowedTools']}"[:400])
 for p in files:
     if p.endswith((".mcp.json", "claude_desktop_config.json")):
         d = load(p); print(f"\n  MCP FILE: {p}")
-        for name, cfg in (d.get("mcpServers") or {}).items():
-            print(f"    MCP {name}: {cfg.get('command') or cfg.get('url')} {' '.join(map(str, cfg.get('args', [])))}"[:300])
+        for name, cfg in mapping(d.get("mcpServers", {}), p + ".mcpServers").items():
+            cfg = mapping(cfg, p + ".server." + name)
+            print(f"    MCP {name}: {cfg.get('command') or cfg.get('url')} {' '.join(map(str, sequence(cfg.get('args', []), 'MCP args')))}"[:300])
 plug = os.path.join(home, ".claude", "plugins")
 if os.path.isdir(plug):
     print(f"\n  PLUGINS em {plug}:")
     for root in sorted(glob.glob(os.path.join(plug, "*"))): print(f"    {root}")
 print("\n  Revise: cada MCP/plugin/hook que você NÃO instalou conscientemente é suspeito. Hooks rodam código a cada ferramenta.")
+sys.exit(1 if invalid else 0)
 PYEOF
+if [ "$?" -ne 0 ]; then log "ERROR: audit section incomplete"; FAIL=1; fi
 
 # ------------------------------------------------- D. PERSISTÊNCIA FORA DO CLAUDE
 hdr "D. PERSISTÊNCIA FORA DO CLAUDE — cron, launch agents, shell rc, git, ssh, binário"
@@ -285,13 +332,22 @@ done | sort -u | tee -a "$REPORT" >/dev/null
 
 # ------------------------------------------------- E. FORENSE DE SESSÕES
 hdr "E. FORENSE DE SESSÕES — comandos de exfiltração executados nos últimos 60 dias"
-PAT='curl [^;|]*(-d ?@|--data|-F ?|-T ?|--upload-file|-X ?(POST|PUT)|--json|\\$\\(|`)|wget [^;|]*--post|gws gmail \\+(send|reply|forward)|mcp__[A-Za-z_]*(send|share|publish|post|push|upload)[A-Za-z_]*|\\bscp |\\brsync [^;|]*@|\\brclone (copy|sync|move)|aws s3 (cp|sync)|gsutil (cp|rsync)|gh gist create|webhook\\.site|hooks\\.slack\\.com|discord(app)?\\.com/api/webhooks|ngrok|pastebin\\.com|transfer\\.sh|ntfy\\.sh|api\\.telegram\\.org|dangerously-skip-permissions|base64 [^;|]*\\| *curl|/dev/tcp/'
+PAT='curl [^;|]*(-d ?@|--data|-F ?|-T ?|--upload-file|-X ?(POST|PUT)|--json|\$\(|`)|wget [^;|]*--post|gws gmail \+(send|reply|forward)|mcp__[A-Za-z_]*(send|share|publish|post|push|upload)[A-Za-z_]*|\bscp |\brsync [^;|]*@|\brclone (copy|sync|move)|aws s3 (cp|sync)|gsutil (cp|rsync)|gh gist create|webhook\.site|hooks\.slack\.com|discord(app)?\.com/api/webhooks|ngrok|pastebin\.com|transfer\.sh|ntfy\.sh|api\.telegram\.org|dangerously-skip-permissions|base64 [^;|]*\| *curl|/dev/tcp/'
+if ! printf '' | grep -E "$PAT" >/dev/null; then
+  # grep returns 1 for no match and 2 for an invalid pattern.
+  printf '' | grep -E "$PAT" >/dev/null
+  RC=$?
+  if [ "$RC" -gt 1 ]; then log "ERROR: invalid forensic pattern"; exit 1; fi
+fi
 log "  (esta seção varre todas as transcrições dos últimos 60 dias; em máquina pesada pode levar vários minutos — transcrições acima de 80 MB são puladas e listadas)"
 if [ -d "$HOME/.claude/projects" ]; then
   find "$HOME/.claude/projects" -name '*.jsonl' -mtime -60 -size +80M 2>/dev/null | sed 's/^/  PULADA (>80MB, grep manual): /' | tee -a "$REPORT" >/dev/null
   find "$HOME/.claude/projects" -name '*.jsonl' -mtime -60 -size -80M 2>/dev/null | while IFS= read -r t; do
-    n=$(grep -cE "$PAT" "$t" 2>/dev/null || true); [ "${n:-0}" -gt 0 ] && log "  $n ocorrência(s) em $t" && grep -oE ".{0,80}($PAT).{0,120}" "$t" | head -5 | sed 's/^/      /' | tee -a "$REPORT" >/dev/null
-  done
+    n=$(grep -cE "$PAT" "$t"); RC=$?
+    if [ "$RC" -gt 1 ]; then log "ERROR: cannot scan transcript $t"; exit 1; fi
+    [ "${n:-0}" -gt 0 ] && log "  $n ocorrência(s) em $t" && grep -oE ".{0,80}($PAT).{0,120}" "$t" | head -5 | sed 's/^/      /' | tee -a "$REPORT" >/dev/null
+    :
+  done || { log "ERROR: transcript audit incomplete"; exit 1; }
   log "  (fim — se nada apareceu acima, nenhuma transcrição recente contém esses padrões)"
 fi
 [ -f "$HOME/.claude/fence-alarms.log" ] && { log "-- Alarmes do Tripwire (fence-alarms.log, últimos 20) --"; tail -20 "$HOME/.claude/fence-alarms.log" | sed 's/^/  /' | tee -a "$REPORT" >/dev/null; }
@@ -305,3 +361,5 @@ log "  4. Rode a Fase 2 do protocolo (revisão assistida com o Claude) usando ES
 log "  5. NÃO apague nada ainda — mova para quarentena (é evidência). Depois rotacione segredos."
 log ""
 log "Relatório salvo em: $REPORT"
+
+exit "$FAIL"
