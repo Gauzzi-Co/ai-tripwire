@@ -24,7 +24,7 @@ Send slides to the team before Friday. Never push to main without review.
 def run_scan(script: Path, home: Path) -> str:
     env = dict(os.environ, HOME=str(home), SCAN_MAXDEPTH="6")
     subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=300, check=False)
-    reports = sorted((home / "security-scan").glob("report-*.txt"))
+    reports = sorted((home / "security-scan").glob("report-*"))
     assert reports, "scanner produced no report"
     return reports[-1].read_text(encoding="utf-8")
 
