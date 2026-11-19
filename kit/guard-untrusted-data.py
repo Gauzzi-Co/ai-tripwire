@@ -17,20 +17,24 @@ instructions), the notice escalates, names what it saw, and records the evidence
 headlines about AI no longer trip it: it now requires an instruction addressed to the assistant
 ("you must run…", "assistant: send…"), not merely the words "AI" and "open" in one sentence.
 
-FAILS CLOSED: if the hook breaks, it announces "fence is DOWN" instead of staying silent. This
+FAILS LOUD: if the hook breaks, it announces "fence is DOWN" instead of staying silent. This
 hook never blocks a tool result — it only adds context.
 
 Install: ~/.claude/hooks/guard-untrusted-data.py + the "hooks" block in settings.json
 (matcher must include Read for the on-disk fence).
 """
 
+import base64
 import datetime
+import html
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
-import time
+import unicodedata
+from html.parser import HTMLParser
 
 OWNER = "the user"  # how Claude should refer to you in the notices
 
@@ -64,7 +68,7 @@ BASH_UNTRUSTED = re.compile(
 # Files read from disk that commonly carry instructions written by third parties
 INSTRUCTION_FILES = re.compile(
     r"(readme|contributing|changelog|claude(\.local)?\.md|agents\.md|gemini\.md|skill\.md|\.cursorrules|\.windsurfrules|copilot-instructions\.md|\.mdc$"
-    r"|/node_modules/|/vendor/|/site-packages/|/\.claude/(agents|commands|skills|plugins)/)",
+    r"|memory\.md|/node_modules/|/vendor/|/site-packages/|/\.claude/(agents|commands|skills|plugins|rules|memory)/|/\.claude/projects/[^/]+/memory/|/\.github/(instructions|prompts|agents|chatmodes)/)",
     re.I,
 )
 
@@ -110,7 +114,7 @@ SIGNATURES = [
         "exfiltration instruction",
     ),
     (
-        re.compile(r"!\[[^\]]*\]\(https?://[^)\s]*[?&][^)\s]*\)", re.I),
+        re.compile(r"!\[[^\[\]\r\n]*\]\(https?://[^)?&\s]*[?&][^)\s]*\)", re.I),
         "image-GET exfiltration pattern (markdown image with query parameters)",
     ),
 ]
@@ -135,9 +139,208 @@ def suspicious_invisible(text):
     return False
 
 
+STEERING_LABEL = "summary/triage steering or false authority"
+INVISIBLE_LABEL = "invisible/bidi/tag unicode"
+HIDDEN_LABEL = "hidden HTML/CSS: "
+
+# Rendering is inspection-only: never execute HTML/CSS, fetch URLs, or recurse
+# into encoded payloads. Normal newsletter preheaders are not an alarm by themselves.
+STEERING = re.compile(
+    r"\b(mark|classify|label)\s+(this|the)\s+(email|message)\s+as\s+(legitimate|urgent|verified|safe)"
+    r"|\b(marque|classifique|rotule)\s+(este|esta|o|a)\s+(e-mail|email|mensagem)\s+como\s+(leg[ií]tim[oa]|urgente|verificad[oa]|segur[oa])"
+    r"|\b(add|include)\s+(a\s+|the\s+)?priority\s+(action|task)"
+    r"|\b(adicione|inclua)\s+(uma\s+)?(a[çc][ãa]o|tarefa)\s+priorit[áa]ria"
+    r"|\b(rate|score)\s+(this|the)\s+(email|message)\s+(as\s+)?\d{1,2}\s*/\s*10"
+    r"|\b(avalie|pontue)\s+(este|esta|o|a)\s+(email|e-mail|mensagem)\s+(como\s+)?\d{1,2}\s*/\s*10"
+    r"|\b(admin|maintenance)\s+mode\b.{0,80}\b(reveal|print|show|expose)\b"
+    r"|\bmodo\s+(de\s+)?(administra[çc][ãa]o|manuten[çc][ãa]o)\b.{0,80}\b(revele|imprima|mostre|exponha)\b",
+    re.I,
+)
+HIDDEN_STYLE = re.compile(
+    r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden|"
+    r"(?:font-size|opacity)\s*:\s*0(?:px|pt|em|rem|%)?)(?:\s*(?:!important)?\s*(?:;|$))",
+    re.I,
+)
+BASE64 = re.compile(
+    r"data:[^,\s]{0,256};base64,(?P<data>[A-Za-z0-9+/_-]+(?:[ \t]*\r?\n[A-Za-z0-9+/_-]+)*={0,2})"
+    r"|(?<![\w+/-])(?P<plain>[A-Za-z0-9+/_-]{16,}(?:[ \t]*\r?\n[A-Za-z0-9+/_-]+)*={0,2})",
+    re.I,
+)
+
+
+class InspectionHTML(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = []
+        self.comments = []
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        style = attrs.get("style") or ""
+        hidden = "hidden" in attrs or bool(HIDDEN_STYLE.search(style))
+        white = r"\s*(?:white|\#fff(?:fff)?)\s*(?:!important\s*)?(?:;|$)"
+        hidden = hidden or bool(
+            re.search(r"(?:^|;)\s*color:" + white, style, re.I)
+            and re.search(r"(?:^|;)\s*background(?:-color)?:" + white, style, re.I)
+        )
+        # These are lexical indicators, not a CSS rendering engine.
+        if tag not in {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }:
+            self.stack.append((tag, hidden or bool(self.stack and self.stack[-1][1])))
+        if tag in {"br", "p", "div", "li"}:
+            self.parts.append(" ")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        # Do not repeatedly search an untrusted, arbitrarily deep stack.
+        if self.stack and self.stack[-1][0] == tag:
+            self.stack.pop()
+
+    def handle_data(self, text):
+        self.parts.append(text)
+        if self.stack and self.stack[-1][1]:
+            self.hidden.append(text)
+
+    def handle_comment(self, text):
+        # Comments are inspected independently: they do not render between
+        # adjacent text fragments and must not break a reconstructed signature.
+        self.comments.append(text)
+
+
+def response_text(response):
+    """Inspect actual string leaves, not JSON-escaped HTML/newlines."""
+    pending = [response]
+    parts = []
+    remaining = 262144
+    nodes = 0
+    while pending and remaining and nodes < 8192:
+        value = pending.pop()
+        nodes += 1
+        if isinstance(value, str):
+            if parts:
+                remaining -= 1
+            parts.append(value[:remaining])
+            remaining -= min(len(value), remaining)
+            if len(value) > len(parts[-1]):
+                return " ".join(parts), True
+        elif isinstance(value, dict):
+            # Input itself is capped at 2 MB; also bound the traversal fan-out.
+            items = list(value.values())
+            if len(items) > 8192:
+                return " ".join(parts), True
+            pending.extend(reversed(items))
+        elif isinstance(value, list):
+            if len(value) > 8192:
+                return " ".join(parts), True
+            pending.extend(reversed(value))
+    return " ".join(parts), bool(pending)
+
+
+def normalized(text):
+    # Two entity layers, one Unicode normalization, and whitespace folding.
+    return " ".join(unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).split())
+
+
+def base64_candidates(text):
+    for match in BASE64.finditer(text):
+        lines = (match.group("data") or match.group("plain")).splitlines()
+        yield "".join(line.strip() for line in lines)
+        # A prose footer can resemble another base64 line. Inspect complete
+        # line-boundary prefixes too, under the SAME global decode budget.
+        prefix = ""
+        for line in lines[:-1]:
+            prefix += line.strip()
+            yield prefix
+
+
+def content_alarms(text):
+    findings = {}
+    patterns = SIGNATURES + [(STEERING, STEERING_LABEL)]
+    html_limited = False
+
+    def inspect(body, origin=""):
+        body = normalized(body)
+        for rx, label in patterns:
+            match = rx.search(body)
+            if match:
+                findings.setdefault(origin + label, body[max(0, match.start() - 60) : match.end() + 60])
+        if suspicious_invisible(body):
+            findings.setdefault(origin + INVISIBLE_LABEL, "(non-printing characters in inspected content)")
+
+    def inspect_views(body, origin=""):
+        nonlocal html_limited
+        inspect(body, origin)
+        markup = html.unescape(html.unescape(body))
+        if "<" not in markup:
+            return
+        # Some supported Python patch versions parse malformed HTML quadratically.
+        # Keep the raw signature view above, but strictly bound each parser input.
+        if len(markup) > 16384:
+            html_limited = True
+            markup = markup[:16384]
+        parser = InspectionHTML()
+        parser.feed(markup)
+        parser.close()
+        inspect("".join(parser.parts), origin)
+        inspect(" ".join(parser.parts), origin)
+        if parser.hidden:
+            inspect("".join(parser.hidden), origin + HIDDEN_LABEL)
+        if parser.comments:
+            inspect(" ".join(parser.comments), origin + HIDDEN_LABEL)
+
+    inspect_views(text)
+    decoded_limit = False
+    remaining = 65536
+    for index, token in enumerate(base64_candidates(html.unescape(html.unescape(text)))):
+        if index >= 32:
+            decoded_limit = True
+            break
+        if len(token) > 16384 or len(token) > remaining:
+            decoded_limit = True
+            continue
+        remaining -= len(token)
+        try:
+            body = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode("utf-8")
+        except (ValueError, UnicodeError):
+            continue
+        inspect_views(body, "base64: ")
+    return list(findings.items()), decoded_limit, html_limited
+
+
+def instruction_path(path, cwd):
+    path = os.path.expanduser(path.replace("\\", "/"))
+    path = path if os.path.isabs(path) else os.path.join(cwd, path)
+    return any(
+        INSTRUCTION_FILES.search(p) or INSTRUCTION_FILES.search(p.rstrip("/") + "/")
+        for p in (os.path.normpath(path), os.path.realpath(path))
+    )
+
+
 def main():
     try:
-        data = json.load(sys.stdin)
+        raw = sys.stdin.read(2_000_001)
+        if len(raw) > 2_000_000:
+            emit(BANNER + " " + FAIL_NOTICE + " Input exceeds the inspection limit.")
+        data = json.loads(raw)
     except Exception:
         emit(FAIL_NOTICE)
 
@@ -145,30 +348,34 @@ def main():
     tin = data.get("tool_input", {}) or {}
     cmd = tin.get("command", "") or ""
 
+    cwd = data.get("cwd") or os.getcwd()
     fenced = bool(INTERNET_TOOLS.search(tool))
     if not fenced and tool == "Bash":
-        fenced = bool(BASH_UNTRUSTED.search(cmd))
+        fenced = bool(BASH_UNTRUSTED.search(cmd) or INSTRUCTION_FILES.search(cmd))
+        if not fenced:
+            try:
+                tokens = shlex.split(cmd)
+                fenced = instruction_path(".", cwd) or any(instruction_path(token, cwd) for token in tokens[:256])
+                if len(tokens) > 256:
+                    fenced = True
+            except ValueError:
+                fenced = True
     if not fenced and tool == "Read":
-        fenced = bool(INSTRUCTION_FILES.search((tin.get("file_path") or "").replace("\\", "/")))
+        fenced = instruction_path(tin.get("file_path") or "", cwd)
     if not fenced:
         sys.exit(0)
 
     resp = data.get("tool_response", "")
-    try:
-        resp_text = resp if isinstance(resp, str) else json.dumps(resp, ensure_ascii=False)
-    except Exception:
-        resp_text = str(resp)
-
-    alarms_detail = []
-    for rx, label in SIGNATURES:
-        m = rx.search(resp_text)
-        if m:
-            snippet = resp_text[max(0, m.start() - 60) : m.end() + 60].replace("\n", " ")
-            alarms_detail.append((label, snippet))
-    if suspicious_invisible(resp_text):
-        alarms_detail.append(("invisible/bidi/tag unicode", "(non-printing characters present in the content)"))
+    resp_text, limited = response_text(resp)
+    alarms_detail, decoded_limit, html_limited = content_alarms(resp_text)
     alarms = sorted(label for label, _ in alarms_detail)
     ctx = BANNER
+    if limited:
+        ctx += " Signature scan limited to 262144 characters / 8192 structured nodes; the remainder is still UNTRUSTED."
+    if decoded_limit:
+        ctx += " Limited base64 inspection (32 blocks, 16384 characters each, 65536 total); all uninspected data remains UNTRUSTED."
+    if html_limited:
+        ctx += " HTML parsing limited to 16384 characters per view; all unparsed data remains UNTRUSTED."
     if alarms:
         ctx += (
             " \U0001f6a8 ALARM: this content matched injection signatures ("
@@ -178,19 +385,7 @@ def main():
         # Local forensic evidence (never synced): an alarm must never be unanswerable after the fact.
         try:
             log_path = os.path.expanduser("~/.claude/fence-alarms.log")
-            fingerprint = f"{tool}|{','.join(alarms)}|{str(tin.get('url') or tin.get('query') or tin.get('file_path') or '')[:120]}"
-            state = os.path.expanduser("~/.claude/.fence-last-alarm")
-            try:
-                last = open(state, encoding="utf-8").read().split("\t", 1)
-                if len(last) == 2 and last[1] == fingerprint and (time.time() - float(last[0])) < 60:
-                    emit(ctx)  # same alarm within a minute: context yes, duplicate log line no
-            except Exception:
-                pass
-            try:
-                with open(state, "w", encoding="utf-8") as sf:
-                    sf.write(f"{time.time()}\t{fingerprint}")
-            except Exception:
-                pass
+            # Never let agent-writable suppression state discard durable evidence.
             try:  # mirror to the OS unified log — the agent cannot erase it without sudo
                 subprocess.run(
                     ["logger", "-t", "tripwire", f"ALARM tool={tool} sig={','.join(alarms)}"], timeout=2, check=False

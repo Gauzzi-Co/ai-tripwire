@@ -6,16 +6,19 @@
 # Pré-requisito: ~/.claude versionado com git (ver documento, seção Tripwire › passo 3).
 set -uo pipefail
 CLAUDE_DIR="$HOME/.claude"; FAIL=0
+DEFENSES=(.gitignore settings.json settings.local.json tripwire.json hooks/ agents/ commands/ skills/ plugins/ rules/ memory/ CLAUDE.md CLAUDE.local.md ':(glob)projects/*/memory/**')
+INSTRUCTIONS=(rules/ memory/ agents/ commands/ skills/ CLAUDE.md CLAUDE.local.md ':(glob)projects/*/memory/**')
 echo "== RELATÓRIO DE INTEGRIDADE TRIPWIRE — $(date '+%Y-%m-%d %H:%M %Z') =="
 
 echo; echo "-- Binário claude (alias/função na frente do binário = vetor) --"
 type claude 2>&1 | head -2
 
 echo; echo "-- Changelog das defesas (git, últimas 10 mudanças) --"
-if git -C "$CLAUDE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git -C "$CLAUDE_DIR" log --oneline -10
+TOP="$(git -C "$CLAUDE_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$TOP" = "$(cd "$CLAUDE_DIR" 2>/dev/null && pwd -P)" ] && git -C "$CLAUDE_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+  if ! git -C "$CLAUDE_DIR" log --oneline -10; then echo "CRITICAL: cannot inspect baseline log"; FAIL=1; fi
   echo; echo "-- Mudanças NÃO commitadas na superfície de defesa --"
-  CH="$(git -C "$CLAUDE_DIR" status --porcelain -- settings.json hooks/ agents/ commands/ skills/ CLAUDE.md 2>/dev/null)"
+  if ! CH="$(git -C "$CLAUDE_DIR" status --porcelain --ignored -uall -- "${DEFENSES[@]}" 2>/dev/null)"; then echo "CRITICAL: cannot inspect defense status"; FAIL=1; fi
   if [ -n "$CH" ]; then echo "$CH"; echo "^ defesas alteradas sem commit — se você não fez isso, INVESTIGUE antes de commitar."; else echo "limpo."; fi
 else
   echo "CRÍTICO: ~/.claude não é um repositório git — sem baseline, sem detecção de adulteração."; FAIL=1
@@ -37,23 +40,67 @@ done
 
 echo; echo "-- Permissões perigosas no settings --"
 for SF in "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.local.json"; do [ -f "$SF" ] || continue; echo "  ($SF)"
-python3 - "$SF" <<'PYEOF'
-import json, sys, re
-try: d = json.load(open(sys.argv[1]))
-except Exception as e: print("  (não consegui ler settings.json:", e, ")"); sys.exit(0)
-p = d.get("permissions", {})
-if p.get("defaultMode") in ("bypassPermissions",): print("  CRÍTICO: defaultMode = bypassPermissions")
-bad = [r for r in p.get("allow", []) if re.search(r"^Bash$|Bash\(\*?\)|Bash\(\*\)|curl|wget|scp|rclone|\brm\b", str(r))]
-print("  allow amplo:", bad if bad else "nenhum")
-if d.get("disableAllHooks"): print("  CRITICAL: disableAllHooks is set — every hook is off")
-hk = d.get("hooks", {}) or {}
-pre = [e for e in hk.get("PreToolUse", []) if any("guard-irreversible" in (h.get("command") or "") for h in e.get("hooks", []))]
-if pre and not any(re.search(r"Bash", e.get("matcher", "")) for e in pre): print("  CRITICAL: guard-irreversible is registered but its matcher does not cover Bash")
+if ! python3 - "$SF" <<'PYEOF'
+import json, sys, re, os
+failed = False
+def critical(message):
+    global failed
+    print("  CRITICAL: " + message)
+    failed = True
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("settings must be an object")
+    p = d.get("permissions", {})
+    if not isinstance(p, dict):
+        raise ValueError("permissions must be an object")
+    if p.get("defaultMode") == "bypassPermissions":
+        critical("defaultMode = bypassPermissions")
+    rules = p.get("allow", [])
+    if not isinstance(rules, list):
+        raise ValueError("permissions.allow must be a list")
+    bad = [r for r in rules if re.search(r"^Bash$|Bash\(\*?\)|curl|wget|scp|rclone|\brm\b", str(r))]
+    print("  broad allow rules:", bad or "none")
+    if d.get("disableAllHooks"):
+        critical("disableAllHooks is set")
+    if os.path.basename(sys.argv[1]) == "settings.json" or "hooks" in d:
+        hooks = d.get("hooks", {})
+        if not isinstance(hooks, dict):
+            raise ValueError("hooks must be an object")
+        requirements = {
+            "PreToolUse": ("guard-irreversible.py", ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch", "Artifact", "mcp__test__send"]),
+            "PostToolUse": ("guard-untrusted-data.py", ["Bash", "Read", "WebFetch", "WebSearch", "mcp__test__read"]),
+        }
+        for event, (script, tools) in requirements.items():
+            entries = hooks.get(event, [])
+            if not isinstance(entries, list):
+                raise ValueError("hook event must be a list")
+            covered = set()
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                    raise ValueError("invalid hook registration")
+                matcher = entry.get("matcher", "")
+                rx = re.compile(matcher or ".*")
+                for hook in entry["hooks"]:
+                    if not isinstance(hook, dict):
+                        raise ValueError("invalid hook command")
+                    expected = 'bash "$HOME/.claude/hooks/tripwire-run.sh" ' + script
+                    # A filename mentioned in an echo/comment is not an installed hook.
+                    if hook.get("type") == "command" and hook.get("command") == expected and not hook.get("async"):
+                        covered.update(t for t in tools if rx.fullmatch(t))
+            missing = sorted(set(tools) - covered)
+            if missing:
+                critical(event + " missing effective Tripwire coverage: " + ", ".join(missing))
+except Exception as e:
+    critical("invalid/unreadable settings: " + type(e).__name__)
+sys.exit(1 if failed else 0)
 PYEOF
+then FAIL=1; fi
 done
 
 echo; echo "-- Drift de memórias/instruções desde a baseline --"
-DRIFT="$(git -C "$CLAUDE_DIR" status --porcelain -uall -- projects/ CLAUDE.md 2>/dev/null || true)"
+if ! DRIFT="$(git -C "$CLAUDE_DIR" status --porcelain --ignored -uall -- "${INSTRUCTIONS[@]}" 2>/dev/null)"; then echo "CRITICAL: cannot inspect instruction status"; FAIL=1; fi
 if [ -n "$DRIFT" ]; then
   echo "$DRIFT" | sed 's/^/  /'
   echo "$DRIFT" | grep -q '^.D' && echo "  NOTA: há deleções — confirme cada uma (envenenamento também pode ser apagamento)."
@@ -61,10 +108,22 @@ if [ -n "$DRIFT" ]; then
 else echo "  limpo — nenhuma mudança."; fi
 
 echo; echo "-- Tripwire de envenenamento (assinaturas SÓ no conteúdo novo) --"
-TMPF="$(mktemp)"
-{ git -C "$CLAUDE_DIR" diff HEAD -- projects/ CLAUDE.md 2>/dev/null | grep '^+' | grep -v '^+++' || true
-  git -C "$CLAUDE_DIR" ls-files --others --exclude-standard -- projects/ 2>/dev/null | while IFS= read -r f; do cat "$CLAUDE_DIR/$f" 2>/dev/null; done
-} > "$TMPF"
+TMPF="$(mktemp)" || exit 1
+DIFF_FILE="$(mktemp)" || exit 1
+LIST_FILE="$(mktemp)" || exit 1
+trap 'rm -f "$TMPF" "$DIFF_FILE" "$LIST_FILE"' EXIT
+if ! git -C "$CLAUDE_DIR" -c core.fsmonitor=false diff --no-ext-diff --no-textconv HEAD -- "${INSTRUCTIONS[@]}" > "$DIFF_FILE"; then
+  echo "CRITICAL: cannot inspect instruction diff"; FAIL=1
+fi
+grep '^+' "$DIFF_FILE" | grep -v '^+++' > "$TMPF" || true
+if ! git -C "$CLAUDE_DIR" ls-files --others -z -- "${INSTRUCTIONS[@]}" > "$LIST_FILE"; then
+  echo "CRITICAL: cannot inventory new instructions"; FAIL=1
+fi
+while IFS= read -r -d '' f; do
+  if ! cat "$CLAUDE_DIR/$f" >> "$TMPF"; then
+    echo "CRITICAL: cannot read new instruction content"; FAIL=1
+  fi
+done < "$LIST_FILE"
 if [ ! -s "$TMPF" ]; then echo "  sem conteúdo novo para escanear."; else
 HITS="$(python3 - "$TMPF" <<'PYEOF'
 import sys, re
@@ -82,6 +141,7 @@ for rx, label in sigs:
     if m: print(f"{label}: ...{t[max(0,m.start()-40):m.end()+40]!r}...")
 PYEOF
 )"
+if [ "$?" -ne 0 ]; then echo "CRITICAL: instruction signature check failed"; FAIL=1; fi
 if [ -n "$HITS" ]; then echo "  CRÍTICO: assinatura(s) em conteúdo NOVO — NÃO commite baseline; rode o protocolo de varredura:"; echo "$HITS" | sed 's/^/    /'; FAIL=1
 else echo "  OK    nenhuma assinatura no conteúdo novo."; fi; fi
 rm -f "$TMPF"

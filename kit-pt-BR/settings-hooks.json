@@ -14,7 +14,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Artifact|mcp__.*",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|Artifact|mcp__.*",
         "hooks": [
           {
             "type": "command",
