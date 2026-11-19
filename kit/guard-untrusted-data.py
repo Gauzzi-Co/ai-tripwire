@@ -222,6 +222,16 @@ def main():
     emit(ctx)
 
 
+# Claude Code writes the hook input as UTF-8 JSON. Python decodes a piped stdin with the locale
+# encoding instead (cp1252 on most Windows installs), so non-ASCII text reached the checks as
+# mojibake: zero-width characters and accented phrases stopped matching, and an ordinary "í"
+# raised the invisible-character alarm (its second byte decodes to a soft hyphen). A strict legacy
+# decoder could not read such input at all. Read UTF-8 whatever the locale says.
+try:
+    sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+except Exception:  # no stdin, or not a text stream: main() announces whatever it cannot read
+    pass
+
 try:
     main()
 except SystemExit:

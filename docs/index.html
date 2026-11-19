@@ -1075,6 +1075,16 @@ def main():
     allow()
 
 
+# Claude Code writes the hook input as UTF-8 JSON. Python decodes a piped stdin with the locale
+# encoding instead (cp1252 on most Windows installs), so non-ASCII text reached the gates as
+# mojibake: a just-written script with an accented name was not recognised, and an accented path
+# could turn a deny into an ask. A strict legacy decoder could not read such input at all. Read
+# UTF-8 whatever the locale says; input that is not valid UTF-8 still fails closed in main().
+try:
+    sys.stdin.reconfigure(encoding=&quot;utf-8&quot;, errors=&quot;strict&quot;)
+except Exception:  # no stdin, or not a text stream: main() fails closed on whatever it cannot read
+    pass
+
 try:
     main()
 except SystemExit:
@@ -1308,6 +1318,16 @@ def main():
 
     emit(ctx)
 
+
+# Claude Code writes the hook input as UTF-8 JSON. Python decodes a piped stdin with the locale
+# encoding instead (cp1252 on most Windows installs), so non-ASCII text reached the checks as
+# mojibake: zero-width characters and accented phrases stopped matching, and an ordinary &quot;í&quot;
+# raised the invisible-character alarm (its second byte decodes to a soft hyphen). A strict legacy
+# decoder could not read such input at all. Read UTF-8 whatever the locale says.
+try:
+    sys.stdin.reconfigure(encoding=&quot;utf-8&quot;, errors=&quot;strict&quot;)
+except Exception:  # no stdin, or not a text stream: main() announces whatever it cannot read
+    pass
 
 try:
     main()
