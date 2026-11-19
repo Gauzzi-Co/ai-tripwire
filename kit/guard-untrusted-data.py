@@ -260,6 +260,18 @@ def normalized(text):
     return " ".join(unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).split())
 
 
+def base64_candidates(text):
+    for match in BASE64.finditer(text):
+        lines = (match.group("data") or match.group("plain")).splitlines()
+        yield "".join(line.strip() for line in lines)
+        # A prose footer can resemble another base64 line. Inspect complete
+        # line-boundary prefixes too, under the SAME global decode budget.
+        prefix = ""
+        for line in lines[:-1]:
+            prefix += line.strip()
+            yield prefix
+
+
 def content_alarms(text):
     findings = {}
     patterns = SIGNATURES + [(STEERING, STEERING_LABEL)]
@@ -298,11 +310,10 @@ def content_alarms(text):
     inspect_views(text)
     decoded_limit = False
     remaining = 65536
-    for index, match in enumerate(BASE64.finditer(html.unescape(html.unescape(text)))):
+    for index, token in enumerate(base64_candidates(html.unescape(html.unescape(text)))):
         if index >= 32:
             decoded_limit = True
             break
-        token = re.sub(r"\s+", "", match.group("data") or match.group("plain"))
         if len(token) > 16384 or len(token) > remaining:
             decoded_limit = True
             continue
