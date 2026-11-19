@@ -352,6 +352,18 @@ def main():
     # ---- 1) Non-Bash tools (MCP, Artifact, …): decide by name — outbound-capable names ask
     if tool != "Bash":
         n = tool.lower()
+        # MCP verbs are not limited to a fixed list of nouns. In particular,
+        # board creation, bulk mutation and cloning can publish arbitrary data.
+        # Split camelCase before lowercasing; inspect the tool, not the server ID.
+        if n.startswith("mcp__"):
+            operation = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tool.rsplit("__", 1)[-1]).lower()
+            if re.match(
+                r"^(?:miro[_-])?(?:(?:bulk|batch)[_-])?(create|update|clone|duplicate|copy)(?:[_-]|$)", operation
+            ):
+                _out(
+                    "ask",
+                    "This MCP tool creates, updates or copies shared data. Review the destination and content before approving.",
+                )
         if n == "webfetch":
             url = str(tin.get("url") or "")
             if re.search(

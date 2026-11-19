@@ -6,6 +6,8 @@ All notable changes to AI Tripwire. Format: [Keep a Changelog](https://keepachan
 
 ### Security corrections
 
+- Inspect hidden/encoded email instructions using bounded HTML entity, markup, Unicode and one-level base64 views; add bilingual summary/triage steering alarms while preserving benign newsletter preheaders (Grok #9).
+- Require approval for MCP creation, update, bulk/batch mutation and cloning names, including the ten Miro board-writing tools from Gauzzi-Co/miro-facilitator-mcp#7. Keep ordinary read tools ungated.
 - Register WebFetch before execution, refresh owned registrations on upgrades, and validate effective event/matcher coverage.
 - Canonicalize protected paths and symlink targets; cover redirects, baseline Git directory options and additional secret readers.
 - Limit self-email, Git and temporary-delete exceptions to understood operations. Check every effective push URL against a canonical host/path; do not inherit an exception across shell commands.
